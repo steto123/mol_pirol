@@ -1,7 +1,12 @@
-A NMR Shift calculation program für Windows
+# A NMR Shift calculation program for Windows
 
 
-Sources
+
+## Installation and Usage
+
+see [INSTALL_DE_EN.md](INSTALL_DE_EN.md)
+
+## Sources
 
 CASCADE
 
