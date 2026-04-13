@@ -1,5 +1,15 @@
+"""
+NMR 13C Prediction App
+Diese GUI-Anwendung kombiniert drei ML/Topologie-Modelle (CASCADE, EST-NMR, DCode),
+um die chemischen C-13 NMR-Verschiebungen aus einem SMILES Code zu prognostizieren und zu vergleichen.
+"""
 import os
 import sys
+
+_NOTEBOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, _NOTEBOOK_DIR)
+
 import logging
 import warnings
 import pandas as pd
@@ -17,6 +27,14 @@ from PyQt5.QtGui import QFont, QColor
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
+
+try:
+    from dcode.geometry import DCodeName
+    from dcode.tools import DCodeMol
+    from dcode.calcshift import calcshift
+except ImportError as e:
+    print(f"Error importing DCode libraries: {e}")
+
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -56,30 +74,55 @@ _CUSTOM_OBJECTS = {
 # Globale Variablen für Modelle (werden beim Start geladen)
 NMR_model_C = None
 NMR_model_E = None
+codes_df = None
 
 def init_models():
-    global NMR_model_C, NMR_model_E
+    """
+    Lädt alle benötigten Modelle und Datenbanken verzögert (lazy loading) beim ersten Klick auf 'Berechnen'.
+    - Lade Tensorflow/Keras Cascade-Model.
+    - Lade EST-NMR Torch-Model.
+    - Längste Ladezeit: Einlesen der extrem großen DCode CSV in pandas.
+    """
+    global NMR_model_C, NMR_model_E, codes_df
     try:
         print("Lade Modelle...")
+        
+        # 1. CASCADE Lade-Routinen
         modelpath_C = os.path.join(_models_dir, "cascade", "trained_model", "best_model.hdf5")
         NMR_model_C = load_model(modelpath_C, custom_objects=_CUSTOM_OBJECTS)
         
+        # 2. EST-NMR PyTorch-Model Laden
         modelpath_E = os.path.join(_models_dir, "DLNMR1.pt")
         NMR_model_E = torch.jit.load(modelpath_E)
+        
+        # 3. DCode Pandas DataFrame importieren (> 40MB Datensatz)
+        codefile = os.path.join(_NOTEBOOK_DIR, "codes", "v3_update_23_10_2025.csv")
+        if os.path.exists(codefile):
+            codes_df = pd.read_csv(codefile, dtype={0: str})
+        else:
+            print(f"WARNUNG: DCode Code-File nicht gefunden: {codefile}")
+            
         print("Modelle erfolgreich geladen!")
     except Exception as e:
         print(f"Fehler beim Laden der Modelle: {e}")
 
 def predict_cascade(mol, model, models_dir):
+    """
+    Graph Neural Network Vorhersage über CASCADE.
+    Verwendet den internen 'preprocessor' um den molekularen Graphen aufzubauen
+    und berechnet das Ergebnis konformer-gewichtet.
+    """
     _CASCADE_DIR = os.path.join(models_dir, "cascade")
     preprocessor_path = os.path.join(_CASCADE_DIR, 'preprocessor.p')
     with open(preprocessor_path, 'rb') as ft:
         preprocessor = pickle.load(ft)['preprocessor']
     
+    # Preprocessing baut Konformere und Kanten-Verbindungen auf
     m = Chem.AddHs(mol, addCoords=True)
     inputs, df, mols = preprocess_C([m], preprocessor, keep_all_cf=True)
     if not inputs: return {}
     
+    # NN Prediction auslösen
     predicted_values = evaluate_C(inputs, preprocessor, model)
     chunks = []
     for _, r in df.iterrows():
@@ -92,16 +135,24 @@ def predict_cascade(mol, model, models_dir):
         chunks.append(df_mol)
     
     if not chunks: return {}
+    
+    # Daten zusammenführen und Boltzmann-Gewichtung der Kraftfeld Energie errechnen
     spread_df = pd.concat(chunks)
     spread_df['predicted'] = predicted_values
     spread_df['b_weight'] = spread_df.relative_E.apply(lambda x: math.exp(-x/(0.001987*298.15)))
     
     df_group = spread_df.set_index(['mol_id', 'atom_index', 'cf_id']).groupby(level=1)
+    # Rückgabe gemittelter Werte
     return {int(a_idx): round(group.apply(lambda x: x['b_weight']*x['predicted'], axis=1).sum()/group.b_weight.sum(), 2) 
             for a_idx, group in df_group}
 
 def predict_est_nmr(mol, model):
+    """
+    Führt Vorhersage mit EST-NMR basierend auf Thomas Hehre et al. (PyTorch) durch.
+    Dieses Tool braucht als primären Input die echten Raumkoordinaten.
+    """
     m = Chem.AddHs(mol, addCoords=True)
+    # Bettet das Mol ein und holt Geometrie, wenn noch keine generiert wurde
     if m.GetNumConformers() == 0:
         if AllChem.EmbedMolecule(m, randomSeed=42) == -1:
             AllChem.Compute2DCoords(m)
@@ -111,6 +162,7 @@ def predict_est_nmr(mol, model):
     species = [atom.GetAtomicNum() for atom in m.GetAtoms()]
     coords = [[pos.x, pos.y, pos.z] for pos in [conf.GetAtomPosition(i) for i in range(m.GetNumAtoms())]]
     
+    # In Tensoren wandeln
     Z = torch.tensor(species, dtype=torch.int64)
     R = torch.tensor(coords, dtype=torch.float32).unsqueeze(0)
     
@@ -118,9 +170,87 @@ def predict_est_nmr(mol, model):
         res = model(Z, R)
     all_shifts = res[2].tolist()
     
+    # Rückgabe nur für Kohlenstoff (C = 6)
     return {i: round(all_shifts[i], 2) for i, atom in enumerate(m.GetAtoms()) if atom.GetAtomicNum() == 6}
 
+def predict_dcode_boltzmann(mol, codes_df_input):
+    """
+    Zieht die Distanz- und Topologie-Logik (DCode) ab und gewichtet
+    diese über die Konformere.
+    """
+    if codes_df_input is None:
+        return {}
+    
+    m = Chem.AddHs(mol, addCoords=True)
+    # Um eine sinnvolle DCode Statistik zu erhalten, brauchen wir MMFF Startwerte
+    if m.GetNumConformers() == 0:
+        if AllChem.EmbedMolecule(m, randomSeed=42) == -1:
+            AllChem.Compute2DCoords(m)
+        AllChem.MMFFOptimizeMolecule(m)
+        
+    # Generiere 10 Konformere für den Boltzmann Test
+    cids = AllChem.EmbedMultipleConfs(m, numConfs=10, randomSeed=42, pruneRmsThresh=0.5)
+    
+    energies = []
+    # Berechne die absolute Energie aller Konformere im MMFF-Kraftfeld
+    for cid in cids:
+        ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
+        if ff:
+            ff.Initialize()
+            ff.Minimize()
+            energies.append((cid, ff.CalcEnergy()))
+            
+    if not energies:
+        return {}
+        
+    # Berechne relative Energien (Delta E) zur Min-Energie
+    min_e = min([e for c, e in energies])
+    # RT berechnen - T = 298.15 K, R = 0.001987 kcal/(mol*K)
+    RT = 0.001987 * 298.15
+    b_weights = {cid: math.exp(-(e - min_e)/RT) for cid, e in energies}
+    sum_w = sum(b_weights.values())
+    b_weights = {cid: w/sum_w for cid, w in b_weights.items()}
+
+    # Initiale Summen-Dictionaries
+    dcode_sums = {atom.GetIdx(): 0.0 for atom in m.GetAtoms() if atom.GetAtomicNum() == 6}
+    weight_sums = {atom.GetIdx(): 0.0 for atom in m.GetAtoms() if atom.GetAtomicNum() == 6}
+    
+    # Berechne den DCode Ansatz für jedes der 10 Konformere
+    for cid, w in b_weights.items():
+        single_conf_m = Chem.Mol(m)
+        single_conf_m.RemoveAllConformers()
+        single_conf_m.AddConformer(m.GetConformer(cid), assignId=True)
+        
+        # Weise dem Molekül seine topologischen Distanz-Namen zu
+        single_conf_m = DCodeName(single_conf_m)
+        single_conf_m = DCodeMol(single_conf_m)
+        
+        for atom in single_conf_m.GetAtoms():
+            if atom.GetAtomicNum() == 6 and atom.HasProp('DCode'):
+                codestring = atom.GetProp('DCode')
+                # Suchstring Abgleich via dcode/calcshift.py (ausgelagert in Pandas)
+                verschiebung, treffer, _, _, _ = calcshift(codes_df_input, codestring, atom.GetIdx())
+                
+                # Ignoriere -999 (nicht gefundene Shifts)
+                if verschiebung != -999 and verschiebung != -999.0:
+                    dcode_sums[atom.GetIdx()] += w * verschiebung
+                    weight_sums[atom.GetIdx()] += w
+                    
+    final_results = {}
+    # Durch den Gewichtungsserver teilen
+    for atom_idx in dcode_sums:
+        if weight_sums[atom_idx] > 0:
+            final_results[atom_idx] = round(dcode_sums[atom_idx] / weight_sums[atom_idx], 2)
+        else:
+            final_results[atom_idx] = np.nan
+            
+    return final_results
+
 def draw_annotated_mol(mol):
+    """
+    Rendert ein Molekül als SVG, wobei die Original-Atom-Indizes
+    auch nach dem Entfernen der Wasserstoffatome korrekt erhalten bleiben.
+    """
     tm_full = Chem.Mol(mol)
     for i, atom in enumerate(tm_full.GetAtoms()):
         atom.SetIntProp("orig_idx", i)
@@ -181,8 +311,8 @@ class NMRApp(QMainWindow):
         
         # Tabelle für Ergebnisse
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Atom Index", "CASCADE", "EST-NMR", "|Diff|"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Atom Index", "CASCADE", "EST-NMR", "DCode", "Spannweite"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setFont(QFont("Segoe UI", 10))
         splitter.addWidget(self.table)
@@ -217,6 +347,7 @@ class NMRApp(QMainWindow):
             # Vorhersagen
             pred_cascade = predict_cascade(mol, NMR_model_C, _models_dir)
             pred_est_nmr = predict_est_nmr(mol, NMR_model_E)
+            pred_dcode = predict_dcode_boltzmann(mol, codes_df) if codes_df is not None else {}
             
             # Ergebnisse sammeln
             results = []
@@ -225,14 +356,20 @@ class NMRApp(QMainWindow):
                     idx = atom.GetIdx()
                     pc = pred_cascade.get(idx, np.nan)
                     pe = pred_est_nmr.get(idx, np.nan)
+                    pd_val = pred_dcode.get(idx, np.nan)
                     
-                    diff = abs(pc - pe) if not (np.isnan(pc) or np.isnan(pe)) else np.nan
+                    valid_shifts = [x for x in [pc, pe, pd_val] if not np.isnan(x)]
+                    if len(valid_shifts) > 0:
+                        spannweite = max(valid_shifts) - min(valid_shifts)
+                    else:
+                        spannweite = np.nan
                     
                     results.append({
                         'idx': idx,
                         'cascade': pc,
                         'est_nmr': pe,
-                        'diff': round(diff, 2) if not np.isnan(diff) else '-'
+                        'dcode': pd_val,
+                        'spannweite': round(spannweite, 2) if not np.isnan(spannweite) else '-'
                     })
             
             # Tabelle updaten
@@ -247,17 +384,21 @@ class NMRApp(QMainWindow):
                 e_val = QTableWidgetItem(str(res['est_nmr']) if not np.isnan(res['est_nmr']) else "N/A")
                 e_val.setTextAlignment(Qt.AlignCenter)
                 
-                d_val = QTableWidgetItem(str(res['diff']))
-                d_val.setTextAlignment(Qt.AlignCenter)
+                dc_val = QTableWidgetItem(str(res['dcode']) if not np.isnan(res['dcode']) else "N/A")
+                dc_val.setTextAlignment(Qt.AlignCenter)
                 
-                # Highlight große Abweichungen zwischen den beiden Modellen
-                if res['diff'] != '-' and float(res['diff']) > 5.0:
-                    d_val.setBackground(QColor(255, 200, 200))
+                s_val = QTableWidgetItem(str(res['spannweite']))
+                s_val.setTextAlignment(Qt.AlignCenter)
+                
+                # Highlight große Abweichungen zwischen den Modellen
+                if res['spannweite'] != '-' and float(res['spannweite']) > 5.0:
+                    s_val.setBackground(QColor(255, 200, 200))
                 
                 self.table.setItem(row, 0, item_idx)
                 self.table.setItem(row, 1, c_val)
                 self.table.setItem(row, 2, e_val)
-                self.table.setItem(row, 3, d_val)
+                self.table.setItem(row, 3, dc_val)
+                self.table.setItem(row, 4, s_val)
                 
         except Exception as e:
             import traceback

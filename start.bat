@@ -4,14 +4,13 @@ echo [EN] Starting NMR Calculator...
 echo [DE] Starte NMR Calculator...
 echo ==============================================================
 
-if not exist venv\Scripts\activate.bat (
+if not exist venv\Scripts\python.exe (
     echo [EN] Error: Virtual environment not found. Please run install.bat first.
     echo [DE] Fehler: Virtuelle Umgebung nicht gefunden. Bitte zuerst install.bat ausfuehren.
     pause
     exit /b
 )
 
-call venv\Scripts\activate.bat
-python nmr_app.py
+venv\Scripts\python.exe nmr_app.py
 
 pause

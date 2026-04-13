@@ -18,7 +18,7 @@ echo.
 echo [EN] Installing required packages. This may take a while...
 echo [DE] Installiere benoetigte Pakete. Dies kann eine Weile dauern...
 python -m pip install --upgrade pip
-pip install pandas numpy torch PyQt5 rdkit tf-keras nfp
+pip install pandas numpy torch PyQt5 rdkit tf-keras nfp scipy scikit-learn
 
 echo.
 echo ==============================================================
