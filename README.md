@@ -6,6 +6,9 @@
 
 see [INSTALL_DE_EN.md](INSTALL_DE_EN.md)
 
+You can also use the release Version. This is a portable python version including all you need. You can download and unzip this version. Then use Starte_NMR_App.bat.
+This is for windows Users only.
+
 ## Sources
 
 CASCADE
