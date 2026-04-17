@@ -1,6 +1,12 @@
 # A NMR Shift calculation program for Windows
 
+## Features
 
+* **Interactive Molecule Viewer**: Inspect the generated molecules seamlessly. The standard 2D view supports panning (drag & drop) and zooming (mouse wheel).
+* **True 3D Conformer Visualization**: Toggle to a fully rotatable, interactive 3D view utilizing `3Dmol.js`. *(Installation of `PyQtWebEngine` via pip required)*
+* **English User Interface**: Fully localized, clean GUI with real-time status bar updates.
+* **Smart Validation**: Dynamic warnings appear if unsupported elements are processed in the CASCADE model.
+* **Consensus Scoring**: The app and notebooks natively calculate both single-conformer and 10-conformer Boltzmann-weighted predictions for the EST-NMR (and DCode) models, allowing for a robust predictive consensus.
 
 ## Installation and Usage
 

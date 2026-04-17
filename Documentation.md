@@ -19,22 +19,23 @@ graph TD
     G -- Ja --> I[Starte parallele Predictions]
     
     I --> J[CASCADE Graph Neural Net]
-    I --> K[EST-NMR NN 3D]
+    I --> K[EST-NMR NN 3D (Single & Boltz)]
     I --> L[DCode Topologie Algorithmus]
     
-    subgraph DCode [DCode Boltzmann-Zyklus]
+    subgraph Konformere [Konformer & Boltzmann Zyklus]
         L1[Generiere 10 Konformere] --> L2[Minimiere Energien mit MMFF94]
         L2 --> L3[Berechne Boltzmann-Gewichte e^-dE/RT]
-        L3 --> L4[Generiere DCodeName & DCodeMol pro Konformer]
-        L4 --> L5[Such in CSV-Datenbank nach Shift]
+        L3 --> L4[Generiere Features: EST-NMR Tensoren / DCode Strings]
+        L4 --> L5[Führe Vorhersage aus (PyTorch / CSV)]
         L5 --> L6[Mittelwert gewichten]
     end
     
-    L --> DCode
+    L --> Konformere
+    K -.->|Nutzt für EST-NMR Boltz| Konformere
     
     J --> M[Ergebnisse sammeln]
     K --> M
-    DCode --> M
+    Konformere --> M
     
     M --> N[Berechne Spannweite Max - Min]
     N --> O{Spannweite > 5.0 ppm?}
@@ -55,8 +56,9 @@ Die `predict_cascade`-Funktion basiert auf einem Graph Neural Network Modell (`G
 * **Quelle**: G.N.N Entwicklungen im Rahmen des CASCADE 13C-C-NMR Prediction Projekts.
 
 ### 2.2 EST-NMR (DLNMR1.pt PyTorch Modell)
-Die `predict_est_nmr`-Funktion lädt ein pre-trained PyTorch Modell. Dieses Neural Network operiert direkt auf den dreidimensionalen Koordinaten der Atomarten.
-* **Funktionsweise**: Das 1D RDKit-Molekül wird (sofern nicht anders vorhanden) gebettet und via MMFF94 optimiert. Koordinatenvektor und Atomtypenvektor werden als Tensoren an das PyTorch-Modell übergeben, welches die Shift-Werte pro Atom index-genau schätzt.
+Die Funktionen `predict_est_nmr` und `predict_est_nmr_boltzmann` laden ein pre-trained PyTorch Modell. Dieses Neural Network operiert direkt auf den dreidimensionalen Koordinaten der Atomarten.
+* **Funktionsweise (Single)**: Das 1D RDKit-Molekül wird (sofern nicht anders vorhanden) gebettet und via MMFF94 optimiert. Koordinatenvektor und Atomtypenvektor werden als Tensoren an das PyTorch-Modell übergeben, welches die Shift-Werte pro Atom index-genau schätzt.
+* **Funktionsweise (Boltzmann)**: Analog zur DCode Methode werden 10 verschiedene Konformere generiert und im Kraftfeld minimiert. Das NN schätzt die chemischen Verschiebungen für jedes Konformer separat. Das Endergebnis ist der gemäß der relativen Energien Boltzmann-gewichtete Mittelwert ($\exp(-\Delta E/RT)$). In der Ergebnistabelle werden beide Varianten (`EST-NMR` und `EST-NMR (Boltz)`) für einen direkten Vergleich dargestellt.
 * **Quelle**: Neuronales Netzwerk. Zitat: Thomas Hehre, Philip E. Klunzinger, Bernard J. Deppmeier, William Sean Ohlinger, Warren J Hehre, doi:10.1021/acs.joc.5c00927.
 
 ### 2.3 DCode (Distance & Topology Code)
