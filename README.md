@@ -28,4 +28,4 @@ Thomas Hehre, Philip E. Klunzinger, Bernard J. Deppmeier, William Sean Ohlinger,
 J. Org. Chem. 2025, 90, 11478−11485 
 Practical Machine Learning Strategies 4: Using Neural Networks to Replicate Proton and 13C NMR Chemical Shifts Obtained from ωB97X-D/6-31G* Density Functional Calculations
 
-<img idth="1001" height="627" alt="image" src="hScreenshot.png" />
+<img idth="1001" height="627" alt="image" src="Screenshot.png" />
