@@ -1,6 +1,11 @@
 @echo off
 cd /d "%~dp0"
 
+:: Entferne fehlerhaften torch Ordner, falls vorhanden (verhindert Absturz)
+IF EXIST "portable_python\WPy64-31180\python-3.11.8.amd64\Lib\site-packages\torch" (
+    rmdir /S /Q "portable_python\WPy64-31180\python-3.11.8.amd64\Lib\site-packages\torch"
+)
+
 :: Versuche zuerst die lokale VENV Umgebung
 IF EXIST "venv\Scripts\pythonw.exe" (
     start "" "venv\Scripts\pythonw.exe" "nmr_app.py"
@@ -15,3 +20,4 @@ IF EXIST "portable_python\WPy64-31180\python-3.11.8.amd64\pythonw.exe" (
 
 echo Weder "venv" noch "portable_python" wurden gefunden!
 pause
+
