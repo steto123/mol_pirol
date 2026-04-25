@@ -1,5 +1,13 @@
 # Release Notes - NMR 13C Prediction App
 
+## Version 0.3 (2026-04-24)
+
+### New Experimental Feature
+* **Hybrid Symmetry Averaging**: Introduced a sophisticated atom-ranking algorithm that improves chemical consistency in predictions.
+    * **3D Refinement**: Unlike standard topological ranking, this algorithm analyzes the 3D geometry (distance sets) to distinguish between cis/trans isomers and axial/equatorial positions.
+    * **Tolerant Grouping**: Uses a 0.4 Å spatial tolerance to ensure that rotating groups (like phenyl rings or methyl groups) are still correctly identified as equivalent despite minor conformational fluctuations.
+    * **User Control**: A new "Symmetry Average" checkbox in the UI allows users to toggle this behavior. When enabled, it averages the predictions of all models across equivalent atoms.
+
 ## Version 0.2 (2026-04-16)
 
 ### Localization / Translations

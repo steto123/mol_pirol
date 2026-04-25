@@ -6,6 +6,18 @@ um die chemischen C-13 NMR-Verschiebungen aus einem SMILES Code zu prognostizier
 import os
 import sys
 
+# Fix for pythonw.exe: Redirect stdout/stderr if they are None to avoid AttributeError
+if sys.stdout is None:
+    class NullWriter:
+        def write(self, data): pass
+        def flush(self): pass
+    sys.stdout = NullWriter()
+if sys.stderr is None:
+    class NullWriter:
+        def write(self, data): pass
+        def flush(self): pass
+    sys.stderr = NullWriter()
+
 _NOTEBOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NOTEBOOK_DIR not in sys.path:
     sys.path.insert(0, _NOTEBOOK_DIR)
@@ -17,6 +29,7 @@ import numpy as np
 import math
 import pickle
 import torch
+import colorsys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView, QSplitter,
@@ -64,10 +77,14 @@ HTML_3DMOL = """
         viewer.zoomTo();
         viewer.render();
     }
-    function highlightAtom(idx) {
+    function highlightAtoms(indices) {
         viewer.setStyle({}, {stick: {radius: 0.15}, sphere: {scale: 0.3}});
-        if (idx !== -1) {
-            viewer.addStyle({serial: idx + 1}, {sphere: {scale: 0.5, color: '#00FFFF'}});
+        if (indices && indices.length > 0) {
+            indices.forEach(function(idx) {
+                if (idx !== -1) {
+                    viewer.addStyle({serial: idx + 1}, {sphere: {scale: 0.5, color: '#00FFFF'}});
+                }
+            });
         }
         viewer.render();
     }
@@ -76,7 +93,7 @@ HTML_3DMOL = """
 </html>
 """
 from PyQt5.QtSvg import QSvgWidget, QGraphicsSvgItem, QSvgRenderer
-from PyQt5.QtGui import QFont, QColor, QPainter
+from PyQt5.QtGui import QFont, QColor, QPainter, QIcon
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -441,9 +458,10 @@ class CalculationWorker(QThread):
     calculation_done = pyqtSignal(object)
     calculation_error = pyqtSignal(str)
 
-    def __init__(self, smiles):
+    def __init__(self, smiles, use_symmetry=False):
         super().__init__()
         self.smiles = smiles
+        self.use_symmetry = use_symmetry
 
     def run(self):
         try:
@@ -471,6 +489,64 @@ class CalculationWorker(QThread):
             pred_est_nmr_boltz = predict_est_nmr_boltzmann(m_3d, b_weights, NMR_model_E)
             pred_dcode = predict_dcode_boltzmann(m_3d, b_weights, codes_df) if codes_df is not None else {}
             
+            self.progress_status.emit("Calculating symmetry ranks...")
+            Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+            base_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
+            
+            # Refine ranks using spatial distances from the 3D structure to distinguish 
+            # cis/trans or axial/equatorial positions that are topologically identical.
+            # We use a tolerant check (0.4A) to avoid over-sensitivity to conformational tilts.
+            if m_3d.GetNumConformers() > 0:
+                best_cid = sorted_confs[0][0] if sorted_confs else 0
+                conf = m_3d.GetConformer(best_cid)
+                num_at = mol.GetNumAtoms()
+                
+                # Pre-calculate distance sets for all atoms
+                all_dist_sets = []
+                for i in range(num_at):
+                    d_set = sorted([conf.GetAtomPosition(i).Distance(conf.GetAtomPosition(j)) 
+                                   for j in range(num_at) if i != j])
+                    all_dist_sets.append(d_set)
+                
+                # Group atoms that are topologically equivalent AND spatially similar
+                sym_ranks = [-1] * num_at
+                next_rank = 0
+                for i in range(num_at):
+                    if sym_ranks[i] == -1:
+                        sym_ranks[i] = next_rank
+                        for j in range(i + 1, num_at):
+                            if sym_ranks[j] == -1 and base_ranks[i] == base_ranks[j]:
+                                # Check spatial similarity with a 0.4A tolerance
+                                is_similar = True
+                                for d1, d2 in zip(all_dist_sets[i], all_dist_sets[j]):
+                                    if abs(d1 - d2) > 0.4:
+                                        is_similar = False
+                                        break
+                                if is_similar:
+                                    sym_ranks[j] = next_rank
+                        next_rank += 1
+            else:
+                sym_ranks = base_ranks
+            
+            if self.use_symmetry:
+                self.progress_status.emit("Applying symmetry averaging...")
+                for pred_dict in [pred_cascade, pred_est_nmr, pred_est_nmr_boltz, pred_dcode]:
+                    if not pred_dict: continue
+                    # Group by rank
+                    rank_to_vals = {}
+                    for atom_idx, val in pred_dict.items():
+                        if np.isnan(val): continue
+                        rank = sym_ranks[atom_idx]
+                        if rank not in rank_to_vals: rank_to_vals[rank] = []
+                        rank_to_vals[rank].append(val)
+                    
+                    # Apply average back to all atoms of the same rank
+                    for atom_idx in list(pred_dict.keys()):
+                        rank = sym_ranks[atom_idx]
+                        if rank in rank_to_vals:
+                            avg_val = sum(rank_to_vals[rank]) / len(rank_to_vals[rank])
+                            pred_dict[atom_idx] = round(avg_val, 2)
+
             result = {
                 'mol': mol,
                 'm_3d': m_3d,
@@ -481,7 +557,9 @@ class CalculationWorker(QThread):
                 'pred_est_nmr': pred_est_nmr,
                 'pred_est_nmr_boltz': pred_est_nmr_boltz,
                 'pred_dcode': pred_dcode,
-                'smiles': self.smiles
+                'sym_ranks': sym_ranks,
+                'smiles': self.smiles,
+                'use_symmetry': self.use_symmetry
             }
             self.calculation_done.emit(result)
             
@@ -530,7 +608,13 @@ class NMRApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NMR 13C Prediction App (Windows 11)")
-        self.resize(1200, 800)
+        self.resize(1400, 900)
+        
+        # Set Application Icon
+        icon_path = os.path.join(os.path.dirname(__file__), "app_icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.setup_ui()
 
     def setup_ui(self):
@@ -564,11 +648,17 @@ class NMRApp(QMainWindow):
         self.export_button.setFont(QFont("Segoe UI", 11))
         self.export_button.clicked.connect(self.export_report)
         
+        self.sym_avg_cb = QCheckBox("Symmetry Average (Exp.)")
+        self.sym_avg_cb.setFont(QFont("Segoe UI", 11))
+        self.sym_avg_cb.setToolTip("Experimental: Average predicted shifts for chemically equivalent atoms using 3D-spatial analysis")
+        self.sym_avg_cb.setChecked(True)
+        
         input_layout.addWidget(self.smiles_label)
         input_layout.addWidget(self.smiles_input)
         input_layout.addWidget(self.draw_button)
         input_layout.addWidget(self.calc_button)
         input_layout.addWidget(self.toggle_3d_cb)
+        input_layout.addWidget(self.sym_avg_cb)
         input_layout.addWidget(self.export_button)
         
         main_layout.addLayout(input_layout)
@@ -612,9 +702,13 @@ class NMRApp(QMainWindow):
         
         # Tab 1: Tabelle für Ergebnisse
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["Atom Index", "Exp. Data", "CASCADE", "EST-NMR", "EST-NMR (Boltz)", "DCode", "Range"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["Atom Index", "Sym. Rank", "Exp. Data", "CASCADE", "EST-NMR", "EST-NMR (Boltz)", "DCode", "Range"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 80)
+        self.table.setColumnWidth(1, 80)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -699,7 +793,14 @@ class NMRApp(QMainWindow):
             if self.table.item(row, 0).text() == str(atom_idx):
                 self.table.selectRow(row)
                 break
-        self.update_highlight(atom_idx)
+        
+        # Highlight all equivalent atoms
+        highlight_indices = [atom_idx]
+        if hasattr(self, 'current_sym_ranks') and atom_idx < len(self.current_sym_ranks):
+            rank = self.current_sym_ranks[atom_idx]
+            highlight_indices = [i for i, r in enumerate(self.current_sym_ranks) if r == rank]
+        
+        self.update_highlight(highlight_indices)
         
     def export_report(self):
         if self.table.rowCount() == 0:
@@ -713,9 +814,9 @@ class NMRApp(QMainWindow):
         try:
             if file_path.endswith('.csv'):
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write("Atom Index,Exp. Data,CASCADE,EST-NMR,EST-NMR (Boltz),DCode,Range\n")
+                    f.write("Atom Index,Sym. Rank,Exp. Data,CASCADE,EST-NMR,EST-NMR (Boltz),DCode,Range\n")
                     for row in range(self.table.rowCount()):
-                        row_data = [self.table.item(row, col).text() for col in range(7)]
+                        row_data = [self.table.item(row, col).text() for col in range(8)]
                         f.write(','.join(row_data) + "\n")
                 QMessageBox.information(self, "Export", f"CSV Exported to {file_path}")
                 
@@ -727,39 +828,83 @@ class NMRApp(QMainWindow):
                     svg_data = base64.b64encode(svg_bytes).decode('utf-8')
                     
                 html = f'''<html><head><style>
-                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; }}
-                    table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-                    th {{ background-color: #f2f2f2; }}
-                    h1, h2 {{ color: #0078D4; }}
-                    .molecule {{ text-align: center; margin: 20px 0; }}
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; color: #333; }}
+                    table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+                    th, td {{ border: 1px solid #ddd; padding: 10px; text-align: center; }}
+                    th {{ background-color: #f8f9fa; font-weight: bold; color: #0078D4; }}
+                    h1, h2, h3 {{ color: #0078D4; border-bottom: 2px solid #0078D4; padding-bottom: 5px; }}
+                    .molecule {{ text-align: center; margin: 30px 0; background: #fff; padding: 20px; border-radius: 8px; }}
+                    .summary {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid #0078D4; }}
+                    .mae {{ color: #1e7e34; font-weight: bold; font-size: 1.1em; }}
                 </style></head><body>
                     <h1>NMR 13C Prediction Report</h1>
-                    <p><b>SMILES:</b> {self.smiles_input.text()}</p>
-                    <p><b>Date:</b> {QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")}</p>
-                    <div class="molecule">'''
+                    <div class="summary">
+                        <p><b>SMILES:</b> {self.smiles_input.text()}</p>
+                        <p><b>Date:</b> {QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")}</p>'''
+                
+                if self.mae_label.text():
+                    html += f'<p class="mae"><b>{self.mae_label.text()}</b></p>'
+                
+                html += '</div>'
                 
                 if svg_data:
-                    html += f'<img src="data:image/svg+xml;base64,{svg_data}" alt="Molecule" width="500"/>'
+                    html += f'<div class="molecule"><h2>Molecular Structure</h2><img src="data:image/svg+xml;base64,{svg_data}" alt="Molecule" width="500"/></div>'
                     
-                html += '''</div><h2>Results</h2><table><tr><th>Atom Index</th><th>Exp. Data</th><th>CASCADE</th><th>EST-NMR</th><th>EST-NMR (Boltz)</th><th>DCode</th><th>Range</th></tr>'''
+                html += '''<h2>Prediction Results</h2>
+                <table>
+                    <tr>
+                        <th>Atom Index</th>
+                        <th>Sym. Rank</th>
+                        <th>Exp. Data</th>
+                        <th>CASCADE</th>
+                        <th>EST-NMR</th>
+                        <th>EST-NMR (Boltz)</th>
+                        <th>DCode</th>
+                        <th>Range (ppm)</th>
+                    </tr>'''
                 
                 for row in range(self.table.rowCount()):
                     html += "<tr>"
-                    for col in range(7):
-                        bg_color = ""
+                    # Symmetry color
+                    bg_color_sym = self.table.item(row, 1).background().color().name()
+                    
+                    for col in range(8):
+                        bg_style = f' style="background-color: {bg_color_sym};"'
                         item = self.table.item(row, col)
-                        if col == 6 and item.background().color() == QColor(255, 200, 200):
-                            bg_color = ' style="background-color: #ffc8c8;"'
-                        html += f"<td{bg_color}>{item.text()}</td>"
+                        
+                        # High range highlight
+                        if col == 7 and item.background().color() == QColor(255, 200, 200):
+                            bg_style = ' style="background-color: #ffc8c8;"'
+                        
+                        # Exp data bold
+                        cell_content = item.text()
+                        if col == 2 and cell_content != "-":
+                            cell_content = f"<b>{cell_content}</b>"
+                            
+                        html += f"<td{bg_style}>{cell_content}</td>"
                     html += "</tr>"
-                html += "</table></body></html>"
+                html += "</table>"
+                
+                # Conformers Table
+                if self.conf_table.rowCount() > 1:
+                    html += "<h2>Conformer Ensemble (Boltzmann)</h2>"
+                    html += "<table><tr><th>Conformer ID</th><th>Abs. Energy (kcal/mol)</th><th>Rel. Energy (kcal/mol)</th><th>Weight (%)</th></tr>"
+                    for row in range(self.conf_table.rowCount()):
+                        html += "<tr>"
+                        for col in range(4):
+                            html += f"<td>{self.conf_table.item(row, col).text()}</td>"
+                        html += "</tr>"
+                    html += "</table>"
+                
+                html += "</body></html>"
                 
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(html)
                     
                 QMessageBox.information(self, "Export", f"HTML Report Exported to {file_path}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Could not export file:\n{str(e)}")
             
     def on_conf_table_selection(self):
@@ -776,13 +921,18 @@ class NMRApp(QMainWindow):
                 js_code = f"if(typeof loadMolecule !== 'undefined') loadMolecule({json.dumps(mol_block)});"
                 self.web_view.page().runJavaScript(js_code)
                 
-                # Re-highlight if an atom is selected in main table
+                # Re-highlight if atoms are selected in main table
                 main_sel = self.table.selectedItems()
                 if main_sel:
                     atom_idx_str = self.table.item(main_sel[0].row(), 0).text()
                     try:
                         atom_idx = int(atom_idx_str)
-                        js_highlight = f"setTimeout(function(){{ if(typeof highlightAtom !== 'undefined') highlightAtom({atom_idx}); }}, 100);"
+                        highlight_indices = [atom_idx]
+                        if hasattr(self, 'current_sym_ranks') and atom_idx < len(self.current_sym_ranks):
+                            rank = self.current_sym_ranks[atom_idx]
+                            highlight_indices = [i for i, r in enumerate(self.current_sym_ranks) if r == rank]
+                        
+                        js_highlight = f"setTimeout(function(){{ if(typeof highlightAtoms !== 'undefined') highlightAtoms({json.dumps(highlight_indices)}); }}, 100);"
                         self.web_view.page().runJavaScript(js_highlight)
                     except ValueError:
                         pass
@@ -792,29 +942,46 @@ class NMRApp(QMainWindow):
     def on_table_selection(self):
         selected_items = self.table.selectedItems()
         if not selected_items:
-            self.update_highlight(-1)
+            self.update_highlight([])
             return
             
         row = selected_items[0].row()
         idx_str = self.table.item(row, 0).text()
         try:
             idx = int(idx_str)
-            self.update_highlight(idx)
-        except ValueError:
-            self.update_highlight(-1)
+            # Find all atoms with same symmetry rank
+            highlight_indices = [idx]
+            if hasattr(self, 'current_sym_ranks') and idx < len(self.current_sym_ranks):
+                rank = self.current_sym_ranks[idx]
+                highlight_indices = [i for i, r in enumerate(self.current_sym_ranks) if r == rank]
             
-    def update_highlight(self, atom_idx):
+            self.update_highlight(highlight_indices)
+        except ValueError:
+            self.update_highlight([])
+            
+    def update_highlight(self, atom_indices):
+        """
+        Updates highlights in both 2D and 3D views.
+        atom_indices can be a single int or a list of ints.
+        """
         if not hasattr(self, 'current_mol') or self.current_mol is None:
             return
             
+        if isinstance(atom_indices, int):
+            if atom_indices == -1:
+                highlight_list = []
+            else:
+                highlight_list = [atom_indices]
+        else:
+            highlight_list = atom_indices
+
         # 1. Update 2D SVG
-        highlight_list = [atom_idx] if atom_idx != -1 else []
         svg_bytes = draw_annotated_mol(self.current_mol, highlight_list)
         self.svg_widget.load(svg_bytes, reset_view=False)
         
         # 2. Update 3D Viewer (if available)
         if WEB_ENGINE_AVAILABLE and getattr(self, 'web_view', None) is not None:
-            js_code = f"if(typeof highlightAtom !== 'undefined') highlightAtom({atom_idx});"
+            js_code = f"if(typeof highlightAtoms !== 'undefined') highlightAtoms({json.dumps(highlight_list)});"
             self.web_view.page().runJavaScript(js_code)
 
     def toggle_view(self, state):
@@ -843,7 +1010,7 @@ class NMRApp(QMainWindow):
         self.mae_label.setText("")
         self.table.clearSelection()
         
-        self.worker = CalculationWorker(smiles)
+        self.worker = CalculationWorker(smiles, use_symmetry=self.sym_avg_cb.isChecked())
         self.worker.progress_status.connect(self.statusBar().showMessage)
         self.worker.calculation_done.connect(self.calculation_success)
         self.worker.calculation_error.connect(self.calculation_err)
@@ -870,6 +1037,7 @@ class NMRApp(QMainWindow):
         mol = result['mol']
         self.current_mol = mol
         self.current_m_3d = result['m_3d']
+        self.current_sym_ranks = result.get('sym_ranks', [])
         
         # Save to history
         smiles = result['smiles']
@@ -926,11 +1094,13 @@ class NMRApp(QMainWindow):
             pred_est_nmr = result['pred_est_nmr']
             pred_est_nmr_boltz = result['pred_est_nmr_boltz']
             pred_dcode = result['pred_dcode']
+            sym_ranks = result.get('sym_ranks', [])
             
             results_list = []
             for atom in mol.GetAtoms():
                 if atom.GetAtomicNum() == 6:
                     idx = atom.GetIdx()
+                    s_rank = sym_ranks[idx] if idx < len(sym_ranks) else -1
                     pc = pred_cascade.get(idx, np.nan)
                     pe = pred_est_nmr.get(idx, np.nan)
                     peb = pred_est_nmr_boltz.get(idx, np.nan)
@@ -944,6 +1114,7 @@ class NMRApp(QMainWindow):
                     
                     results_list.append({
                         'idx': idx,
+                        'sym_rank': s_rank,
                         'cascade': pc,
                         'est_nmr': pe,
                         'est_nmr_boltz': peb,
@@ -964,15 +1135,51 @@ class NMRApp(QMainWindow):
                     exp_shifts = []
             
             if exp_shifts:
-                results_list.sort(key=lambda x: x['avg'], reverse=True)
-                for i in range(min(len(exp_shifts), len(results_list))):
-                    results_list[i]['exp'] = str(exp_shifts[i])
-                results_list.sort(key=lambda x: x['idx'])
+                unique_c_ranks = sorted(list(set([res['sym_rank'] for res in results_list])), reverse=True)
+                
+                # If we have exactly as many or fewer signals than unique symmetry groups, group them
+                if len(exp_shifts) <= len(unique_c_ranks):
+                    rank_to_avg = {}
+                    for res in results_list:
+                        r = res['sym_rank']
+                        if r not in rank_to_avg: rank_to_avg[r] = []
+                        rank_to_avg[r].append(res['avg'])
+                    
+                    group_shifts = []
+                    for r, vals in rank_to_avg.items():
+                        group_shifts.append({'rank': r, 'avg_pred': sum(vals)/len(vals)})
+                    group_shifts.sort(key=lambda x: x['avg_pred'], reverse=True)
+                    
+                    rank_to_exp = {}
+                    for i in range(min(len(exp_shifts), len(group_shifts))):
+                        rank_to_exp[group_shifts[i]['rank']] = str(exp_shifts[i])
+                    
+                    for res in results_list:
+                        res['exp'] = rank_to_exp.get(res['sym_rank'], '')
+                else:
+                    # Fallback to standard 1-to-1 matching
+                    results_list.sort(key=lambda x: x['avg'], reverse=True)
+                    for i in range(min(len(exp_shifts), len(results_list))):
+                        results_list[i]['exp'] = str(exp_shifts[i])
+                    results_list.sort(key=lambda x: x['idx'])
                     
             self.table.setRowCount(len(results_list))
+            
+            # Create a color map for symmetry ranks
+            unique_all_ranks = sorted(list(set([res['sym_rank'] for res in results_list])))
+            rank_colors = {}
+            for i, r in enumerate(unique_all_ranks):
+                # Using a slightly higher saturation (0.12 instead of 0.05) to make it visible
+                h = (i * 0.618033988749895) % 1.0
+                r_col, g_col, b_col = colorsys.hsv_to_rgb(h, 0.12, 0.98)
+                rank_colors[r] = QColor(int(r_col*255), int(g_col*255), int(b_col*255))
+
             for row, res in enumerate(results_list):
                 item_idx = QTableWidgetItem(str(res['idx']))
                 item_idx.setTextAlignment(Qt.AlignCenter)
+                
+                item_sym = QTableWidgetItem(str(res['sym_rank']))
+                item_sym.setTextAlignment(Qt.AlignCenter)
                 
                 exp_val = QTableWidgetItem(res['exp'] if res['exp'] else "-")
                 exp_val.setTextAlignment(Qt.AlignCenter)
@@ -992,16 +1199,24 @@ class NMRApp(QMainWindow):
                 s_val = QTableWidgetItem(str(res['spannweite']))
                 s_val.setTextAlignment(Qt.AlignCenter)
                 
+                self.table.setItem(row, 0, item_idx)
+                self.table.setItem(row, 1, item_sym)
+                self.table.setItem(row, 2, exp_val)
+                self.table.setItem(row, 3, c_val)
+                self.table.setItem(row, 4, e_val)
+                self.table.setItem(row, 5, eb_val)
+                self.table.setItem(row, 6, dc_val)
+                self.table.setItem(row, 7, s_val)
+                
+                # Apply symmetry background color
+                bg_color = rank_colors.get(res['sym_rank'], QColor(255, 255, 255))
+                for col in range(8):
+                    item = self.table.item(row, col)
+                    if item: item.setBackground(bg_color)
+                
+                # Overwrite range background if high
                 if res['spannweite'] != '-' and float(res['spannweite']) > 5.0:
                     s_val.setBackground(QColor(255, 200, 200))
-                
-                self.table.setItem(row, 0, item_idx)
-                self.table.setItem(row, 1, exp_val)
-                self.table.setItem(row, 2, c_val)
-                self.table.setItem(row, 3, e_val)
-                self.table.setItem(row, 4, eb_val)
-                self.table.setItem(row, 5, dc_val)
-                self.table.setItem(row, 6, s_val)
                 
             self.current_preds = {
                 "CASCADE": pred_cascade,
@@ -1013,31 +1228,49 @@ class NMRApp(QMainWindow):
                 self.update_spectrum()
                 
             # Perform Auto-MAE Assignment if exp data provided
-            exp_text = self.exp_input.text().strip()
-            if exp_text:
+            if exp_text and exp_shifts:
                 try:
-                    exp_shifts = [float(x.strip()) for x in exp_text.replace(';', ',').split(',') if x.strip()]
-                    if exp_shifts:
-                        exp_shifts.sort(reverse=True)
-                        mae_texts = []
-                        for m_name, p_dict in self.current_preds.items():
-                            p_vals = [v for v in p_dict.values() if not np.isnan(v)]
-                            if not p_vals: continue
-                            p_vals.sort(reverse=True)
+                    mae_texts = []
+                    for m_name, p_dict in self.current_preds.items():
+                        # Get predictions for all C atoms that have a prediction
+                        atom_preds = []
+                        for res in results_list:
+                            val = p_dict.get(res['idx'], np.nan)
+                            if not np.isnan(val):
+                                atom_preds.append({'val': val, 'rank': res['sym_rank']})
+                        
+                        if not atom_preds: continue
+                        
+                        unique_ranks_in_model = sorted(list(set([p['rank'] for p in atom_preds])), reverse=True)
+                        
+                        if len(exp_shifts) <= len(unique_ranks_in_model):
+                            # Symmetry-aware grouping
+                            rank_groups = {}
+                            for p in atom_preds:
+                                if p['rank'] not in rank_groups: rank_groups[p['rank']] = []
+                                rank_groups[p['rank']].append(p['val'])
                             
-                            # pair up
+                            group_avg_preds = sorted([sum(vals)/len(vals) for vals in rank_groups.values()], reverse=True)
+                            pairs = min(len(exp_shifts), len(group_avg_preds))
+                            if pairs > 0:
+                                errors = [abs(exp_shifts[i] - group_avg_preds[i]) for i in range(pairs)]
+                                mae = sum(errors)/pairs
+                                mae_texts.append(f"{m_name}: {mae:.2f} ppm")
+                        else:
+                            # 1-to-1 matching
+                            p_vals = sorted([p['val'] for p in atom_preds], reverse=True)
                             pairs = min(len(exp_shifts), len(p_vals))
                             if pairs > 0:
                                 errors = [abs(exp_shifts[i] - p_vals[i]) for i in range(pairs)]
                                 mae = sum(errors)/pairs
                                 mae_texts.append(f"{m_name}: {mae:.2f} ppm")
                                 
-                        if mae_texts:
-                            self.mae_label.setText("Exp. MAE: " + " | ".join(mae_texts))
-                        else:
-                            self.mae_label.setText("")
-                except ValueError:
-                    self.mae_label.setText("Invalid format in Exp. Data!")
+                    if mae_texts:
+                        self.mae_label.setText("Exp. MAE: " + " | ".join(mae_texts))
+                    else:
+                        self.mae_label.setText("")
+                except Exception:
+                    pass
                     
         except Exception as e:
             import traceback

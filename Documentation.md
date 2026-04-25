@@ -6,45 +6,45 @@ Diese Applikation bietet eine grafische Oberfläche zur Vorhersage von 13C-NMR-V
 
 ```mermaid
 graph TD
-    A[Start: UI initialisiert] --> B[Benutzer gibt SMILES ein]
-    B --> C(Klick auf 'Berechnen')
+    A["Start: UI initialisiert"] --> B["Benutzer gibt SMILES ein"]
+    B --> C("Klick auf 'Berechnen'")
     
-    C --> D{Wurde SMILES erkannt?}
-    D -- Nein --> E[Fehlermeldung]
-    D -- Ja --> F[RDKit generiert 2D-Molekül & SVG Bild]
+    C --> D{"Wurde SMILES erkannt?"}
+    D -- Nein --> E["Fehlermeldung"]
+    D -- Ja --> F["RDKit generiert 2D-Molekül & SVG Bild"]
     
-    F --> G{Sind Modelle im RAM?}
-    G -- Nein --> H[Modelle & CSV-DB Laden]
+    F --> G{"Sind Modelle im RAM?"}
+    G -- Nein --> H["Modelle & CSV-DB Laden"]
     H --> I
-    G -- Ja --> I[Starte parallele Predictions]
+    G -- Ja --> I["Starte parallele Predictions"]
     
-    I --> J[CASCADE Graph Neural Net]
-    I --> K[EST-NMR NN 3D (Single & Boltz)]
-    I --> L[DCode Topologie Algorithmus]
+    I --> J["CASCADE Graph Neural Net"]
+    I --> K["EST-NMR NN 3D (Single & Boltz)"]
+    I --> L["DCode Topologie Algorithmus"]
     
-    subgraph Konformere [Konformer & Boltzmann Zyklus]
-        L1[Generiere 10 Konformere] --> L2[Minimiere Energien mit MMFF94]
-        L2 --> L3[Berechne Boltzmann-Gewichte e^-dE/RT]
-        L3 --> L4[Generiere Features: EST-NMR Tensoren / DCode Strings]
-        L4 --> L5[Führe Vorhersage aus (PyTorch / CSV)]
-        L5 --> L6[Mittelwert gewichten]
+    subgraph Konformere ["Konformer & Boltzmann Zyklus"]
+        L1["Generiere 10 Konformere"] --> L2["Minimiere Energien mit MMFF94"]
+        L2 --> L3["Berechne Boltzmann-Gewichte e^-dE/RT"]
+        L3 --> L4["Generiere Features: EST-NMR Tensoren / DCode Strings"]
+        L4 --> L5["Führe Vorhersage aus (PyTorch / CSV)"]
+        L5 --> L6["Mittelwert gewichten"]
     end
     
-    L --> Konformere
-    K -.->|Nutzt für EST-NMR Boltz| Konformere
+    L --> L1
+    K -.->|Nutzt für EST-NMR Boltz| L1
     
-    J --> M[Ergebnisse sammeln]
+    J --> M["Ergebnisse sammeln"]
     K --> M
-    Konformere --> M
+    L6 --> M
     
-    M --> N[Berechne Spannweite Max - Min]
+    M --> N["Berechne Spannweite Max - Min"]
     N --> O{Spannweite > 5.0 ppm?}
-    O -- Ja --> P[Zelle im UI Rötlich markieren]
-    O -- Nein --> Q[Normal in Tabelle eintragen]
+    O -- Ja --> P["Zelle im UI Rötlich markieren"]
+    O -- Nein --> Q["Normal in Tabelle eintragen"]
     
-    P --> R[Anzeige im UI TableWidget]
+    P --> R["Anzeige im UI TableWidget"]
     Q --> R
-    R --> S[Bereit für nächsten SMILES]
+    R --> S["Bereit für nächsten SMILES"]
 ```
 
 ## 2. Implementierte Methoden
@@ -68,3 +68,18 @@ Die `predict_dcode_boltzmann`-Funktion verwendet einen proprietären, neu integr
 
 ### 2.4 Spannweite als Qualitätssiegel
 Für jedes C-Atom vergleicht das Skript die berechneten Werte aller 3 Modelle. Die `"Spannweite"` wird als `Maximum(Shifts) - Minimum(Shifts)` berechnet. Liegt sie höher als 5 ppm, wird die Tabelle rot markiert. Dies weist den Experten auf herausfordernde stereochemische Bereiche, anormale Elektronegativitäten oder RDKit-Geometriefehler hin.
+
+## 2.5 Symmetrie-Mittelung (Experimentelles Feature)
+Die Applikation nutzt ein hybrides Verfahren zur Identifizierung chemisch äquivalenter Atome, um die Vorhersagequalität zu steigern.
+
+*   **Hybrid-Ansatz**:
+    1.  **Topologisches Ranking**: Zuerst wird via `RDKit.Chem.CanonicalRankAtoms` ein Basis-Ranking erstellt, das Chiralität und stereochemische Zentren berücksichtigt.
+    2.  **Räumliche Verfeinerung (3D)**: Da rein topologische Verfahren oft Probleme haben, räumliche Unterschiede wie Cis/Trans-Positionen oder Axial/Äquatorial-Stellungen in Ringen zu unterscheiden (wenn diese topologisch identisch erscheinen), wird eine zusätzliche geometrische Analyse durchgeführt.
+*   **Funktionsweise der 3D-Verfeinerung**:
+    *   Für jedes Atom wird ein "geometrischer Fingerabdruck" basierend auf den Distanzen zu allen anderen Atomen in der stabilsten 3D-Konformation berechnet.
+    *   Atome werden nur dann als symmetrisch äquivalent gruppiert, wenn sie sowohl topologisch gleich sind als auch räumlich innerhalb einer **Toleranz von 0,4 Å** liegen.
+    *   **Nutzen**: Dies ermöglicht es, rotierende Gruppen (wie Phenylringe) trotz minimaler 3D-Verzerrungen zusammenzufassen, während starre geometrische Isomere (Cis/Trans) zuverlässig unterschieden werden.
+*   **Symmetry Average Option**: Über die Checkbox `"Symmetry Average"` im UI kann gesteuert werden, ob die Vorhersagewerte für äquivalente Atome gemittelt werden sollen. 
+    *   *Aktiviert*: Alle Atome desselben Rangs erhalten denselben gemittelten Shift-Wert. Dies entspricht der chemischen Erwartung für frei rotierende oder symmetrische Moleküle in Lösung.
+    *   *Deaktiviert*: Jedes Atom behält seinen individuellen Vorhersagewert (nützlich zur Analyse von Geometrie-Effekten oder Instabilitäten der Modelle).
+*   **Hinweis (Experimentell)**: Da die Symmetrie-Erkennung von der Qualität der initialen 3D-Einbettung (MMFF94) abhängt, kann es in seltenen Fällen bei sehr flexiblen Molekülen zu einer Über- oder Untersegmentierung kommen. Die Ergebnisse sollten daher im Einzelfall kritisch geprüft werden. Der Rang wird zur Kontrolle in der Spalte `"Sym. Rank"` angezeigt.

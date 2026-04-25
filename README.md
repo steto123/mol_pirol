@@ -15,6 +15,7 @@
 * **English User Interface**: Fully localized, clean GUI with real-time status bar updates.
 * **Smart Validation**: Dynamic warnings appear if unsupported elements are processed in the CASCADE model.
 * **Consensus Scoring**: The app and notebooks natively calculate both single-conformer and 10-conformer Boltzmann-weighted predictions for the EST-NMR (and DCode) models, allowing for a robust predictive consensus.
+* **Symmetry Averaging (Experimental)**: Optionally average predicted shifts for chemically equivalent atoms. It uses a smart hybrid ranking system that combines RDKit's topological canonical ranking with 3D spatial distance analysis (0.4 Å tolerance) to correctly distinguish between rigid stereochemical positions (like cis/trans) while grouping rotating groups.
 
 ## Installation and Usage
 
