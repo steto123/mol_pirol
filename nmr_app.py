@@ -96,7 +96,7 @@ from PyQt5.QtSvg import QSvgWidget, QGraphicsSvgItem, QSvgRenderer
 from PyQt5.QtGui import QFont, QColor, QPainter, QIcon
 
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 try:
@@ -108,6 +108,7 @@ except ImportError as e:
 
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, module="tf_keras")
@@ -672,11 +673,17 @@ class NMRApp(QMainWindow):
         self.exp_input = QLineEdit()
         self.exp_input.setPlaceholderText("Optional Exp. Shifts (comma sep. e.g. 15.2, 128.4) for Auto-MAE")
         
+        self.dark_mode_cb = QCheckBox("🌙 Dark Mode")
+        self.dark_mode_cb.setFont(QFont("Segoe UI", 10))
+        self.dark_mode_cb.toggled.connect(self.toggle_dark_mode)
+        
         aux_layout.addWidget(QLabel("History:"))
         aux_layout.addWidget(self.history_combo)
         aux_layout.addSpacing(20)
         aux_layout.addWidget(QLabel("Exp. Data:"))
         aux_layout.addWidget(self.exp_input)
+        aux_layout.addStretch()
+        aux_layout.addWidget(self.dark_mode_cb)
         
         main_layout.addLayout(aux_layout)
         
@@ -728,7 +735,16 @@ class NMRApp(QMainWindow):
         self.conf_table.itemSelectionChanged.connect(self.on_conf_table_selection)
         tabs.addTab(self.conf_table, "Conformers")
         
-        # Tab 3: Spectrum
+        # Tab 3: Molecule Info
+        self.info_table = QTableWidget()
+        self.info_table.setColumnCount(2)
+        self.info_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.info_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.info_table.verticalHeader().setVisible(False)
+        self.info_table.setFont(QFont("Segoe UI", 10))
+        tabs.addTab(self.info_table, "Molecule Info")
+        
+        # Tab 4: Spectrum
         if HAS_MATPLOTLIB:
             self.spectrum_widget = QWidget()
             val_layout = QVBoxLayout(self.spectrum_widget)
@@ -841,6 +857,16 @@ class NMRApp(QMainWindow):
                     <div class="summary">
                         <p><b>SMILES:</b> {self.smiles_input.text()}</p>
                         <p><b>Date:</b> {QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")}</p>'''
+                
+                # Add Molecule Info to Summary
+                if self.info_table.rowCount() > 0:
+                    html += '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; border-top: 1px solid #ccc; padding-top: 10px;">'
+                    for row in range(self.info_table.rowCount()):
+                        prop = self.info_table.item(row, 0).text()
+                        val = self.info_table.item(row, 1).text()
+                        if prop != "SMILES": # Already shown
+                            html += f'<div><b>{prop}:</b> {val}</div>'
+                    html += '</div>'
                 
                 if self.mae_label.text():
                     html += f'<p class="mae"><b>{self.mae_label.text()}</b></p>'
@@ -1028,7 +1054,51 @@ class NMRApp(QMainWindow):
             if smiles in self.session_cache:
                 self.smiles_input.setText(smiles)
                 self.calculation_success(self.session_cache[smiles])
-                
+
+    def toggle_dark_mode(self, enabled):
+        from PyQt5.QtGui import QPalette
+        if enabled:
+            palette = QPalette()
+            palette.setColor(QPalette.Window, QColor(45, 45, 45))
+            palette.setColor(QPalette.WindowText, Qt.white)
+            palette.setColor(QPalette.Base, QColor(30, 30, 30))
+            palette.setColor(QPalette.AlternateBase, QColor(45, 45, 45))
+            palette.setColor(QPalette.ToolTipBase, Qt.white)
+            palette.setColor(QPalette.ToolTipText, Qt.white)
+            palette.setColor(QPalette.Text, Qt.white)
+            palette.setColor(QPalette.Button, QColor(45, 45, 45))
+            palette.setColor(QPalette.ButtonText, Qt.white)
+            palette.setColor(QPalette.BrightText, Qt.red)
+            palette.setColor(QPalette.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            QApplication.setPalette(palette)
+            
+            self.setStyleSheet("""
+                QMainWindow { background-color: #2d2d2d; }
+                QTableWidget { gridline-color: #3f3f46; background-color: #1e1e1e; color: white; }
+                QHeaderView::section { background-color: #333337; color: white; border: 1px solid #3f3f46; }
+                QTabBar::tab { background-color: #2d2d30; color: white; padding: 8px; }
+                QTabBar::tab:selected { background-color: #1e1e1e; border-bottom: 2px solid #0078d4; }
+                QCheckBox { color: white; }
+                QLabel { color: white; }
+                QLineEdit { background-color: #3c3c3c; color: white; border: 1px solid #555; }
+                QComboBox { background-color: #3c3c3c; color: white; border: 1px solid #555; }
+                QPushButton { background-color: #444; color: white; border: 1px solid #666; }
+                QPushButton:hover { background-color: #555; }
+            """)
+            if hasattr(self, 'web_view') and self.web_view is not None:
+                self.web_view.page().runJavaScript("if(typeof viewer !== 'undefined') { viewer.setBackgroundColor('black'); viewer.render(); }")
+        else:
+            QApplication.setPalette(QApplication.style().standardPalette())
+            self.setStyleSheet("")
+            if hasattr(self, 'web_view') and self.web_view is not None:
+                self.web_view.page().runJavaScript("if(typeof viewer !== 'undefined') { viewer.setBackgroundColor('white'); viewer.render(); }")
+        
+        # Refresh colors in table if data exists
+        if hasattr(self, 'session_cache') and self.smiles_input.text() in self.session_cache:
+            self.calculation_success(self.session_cache[self.smiles_input.text()])
+
     def calculation_success(self, result):
         self.calc_button.setEnabled(True)
         self.calc_button.setText("Calculate")
@@ -1090,6 +1160,28 @@ class NMRApp(QMainWindow):
                     js_code = f"if(typeof loadMolecule !== 'undefined') loadMolecule({json.dumps(mol_block)});"
                     self.web_view.page().runJavaScript(js_code)
                     
+            # 2. Update Molecule Info Tab
+            mol_info = [
+                ("Molecular Formula", rdMolDescriptors.CalcMolFormula(mol)),
+                ("Molecular Weight", f"{Descriptors.ExactMolWt(mol):.3f} g/mol"),
+                ("Number of Atoms", str(mol.GetNumAtoms())),
+                ("Heavy Atoms", str(mol.GetNumHeavyAtoms())),
+                ("Rotatable Bonds", str(rdMolDescriptors.CalcNumRotatableBonds(mol))),
+                ("Rings", str(rdMolDescriptors.CalcNumRings(mol))),
+                ("Aromatic Rings", str(rdMolDescriptors.CalcNumAromaticRings(mol))),
+                ("LogP", f"{Descriptors.MolLogP(mol):.2f}"),
+                ("TPSA", f"{Descriptors.TPSA(mol):.2f} Å²"),
+                ("SMILES", result['smiles'])
+            ]
+            
+            self.info_table.setRowCount(len(mol_info))
+            for i, (prop, val) in enumerate(mol_info):
+                prop_item = QTableWidgetItem(prop)
+                prop_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                val_item = QTableWidgetItem(val)
+                self.info_table.setItem(i, 0, prop_item)
+                self.info_table.setItem(i, 1, val_item)
+
             pred_cascade = result['pred_cascade']
             pred_est_nmr = result['pred_est_nmr']
             pred_est_nmr_boltz = result['pred_est_nmr_boltz']
@@ -1168,10 +1260,13 @@ class NMRApp(QMainWindow):
             # Create a color map for symmetry ranks
             unique_all_ranks = sorted(list(set([res['sym_rank'] for res in results_list])))
             rank_colors = {}
+            is_dark = self.dark_mode_cb.isChecked()
             for i, r in enumerate(unique_all_ranks):
-                # Using a slightly higher saturation (0.12 instead of 0.05) to make it visible
                 h = (i * 0.618033988749895) % 1.0
-                r_col, g_col, b_col = colorsys.hsv_to_rgb(h, 0.12, 0.98)
+                # Tabellenfarben bleiben immer hell (eigene Hintergrundfarben), damit schwarzer Text lesbar ist
+                s = 0.15 if not is_dark else 0.28
+                v = 0.95 if not is_dark else 0.88
+                r_col, g_col, b_col = colorsys.hsv_to_rgb(h, s, v)
                 rank_colors[r] = QColor(int(r_col*255), int(g_col*255), int(b_col*255))
 
             for row, res in enumerate(results_list):
@@ -1186,6 +1281,7 @@ class NMRApp(QMainWindow):
                 font = QFont()
                 font.setBold(True)
                 exp_val.setFont(font)
+                # Exp.-Data immer dunkelgrün (Hintergrund ist immer hell)
                 exp_val.setForeground(QColor("#1e7e34"))
                 
                 c_val = QTableWidgetItem(str(res['cascade']) if not np.isnan(res['cascade']) else "N/A")
@@ -1209,14 +1305,27 @@ class NMRApp(QMainWindow):
                 self.table.setItem(row, 7, s_val)
                 
                 # Apply symmetry background color
-                bg_color = rank_colors.get(res['sym_rank'], QColor(255, 255, 255))
+                # Fallback: helles Grau in beiden Modi (Tabelle hat immer eigene Hintergrundfarben)
+                default_bg = QColor(220, 220, 220) if is_dark else QColor(255, 255, 255)
+                bg_color = rank_colors.get(res['sym_rank'], default_bg)
                 for col in range(8):
                     item = self.table.item(row, col)
-                    if item: item.setBackground(bg_color)
+                    if item:
+                        item.setBackground(bg_color)
+                        # Immer dunkle Schrift auf hellen Sym-Rank-Hintergründen (außer Exp.-Data)
+                        if col != 2:
+                            item.setForeground(Qt.black)
                 
-                # Overwrite range background if high
+                # Overwrite range background if high (Accessibility: use icon and text for color-blind)
                 if res['spannweite'] != '-' and float(res['spannweite']) > 5.0:
-                    s_val.setBackground(QColor(255, 200, 200))
+                    if is_dark:
+                        s_val.setBackground(QColor(180, 50, 50)) # Stronger red for dark
+                    else:
+                        s_val.setBackground(QColor(255, 200, 200))
+                    
+                    s_val.setText(f"⚠️ {res['spannweite']}")
+                    s_val.setFont(font) # bold
+                    s_val.setToolTip("High range (> 5 ppm) indicates model disagreement or geometric instability.")
                 
             self.current_preds = {
                 "CASCADE": pred_cascade,

@@ -1,5 +1,23 @@
 # Release Notes - NMR 13C Prediction App
 
+## Version 0.4 (2026-05-05)
+
+### Bug Fixes
+* **Dark Mode Table Readability**: Fixed poor contrast in the Results table when Dark Mode was active. The symmetry-rank background colors are now consistently light-toned (HSV `v=0.88–0.95`) in both light and dark mode, and all table cell text is now explicitly set to black (`Qt.black`). This eliminates the previous issue of white text on light-pastel backgrounds. The Exp. Data column retains its dark-green color (`#1e7e34`).
+
+### Documentation
+* **New Section — Experimental Data Assignment (Auto-MAE)**: Added a comprehensive new section (§3) to `Documentation.md` explaining the two-stage assignment algorithm (symmetry-group-based vs. 1-to-1 fallback), the role of the cross-model average (`avg`) as the sort key, the independence of the MAE calculation from the assignment, and a detailed analysis of when the procedure may produce suboptimal assignments under high model disagreement (§3.7).
+
+### Packaging & Distribution
+* **Version number corrected**: `build_installer.iss` now reflects version `0.4` (previously incorrectly set to `1.0`).
+* **Documentation files included in installer**: `README.md`, `Documentation.md`, `RELEASE_NOTES.md`, and `INSTALL_DE_EN.md` are now bundled into the Inno Setup installer.
+* **`cleanup_before_package.bat` fixed**: Removed blocking `pause` that prevented automated full-rebuild runs.
+
+### Other
+* **README.md overhauled**: Complete rewrite with Badges, method comparison table, full installation instructions (Portable + From Source), directory structure diagram, usage guide, and properly formatted citations with DOI links.
+
+---
+
 ## Version 0.3 (2026-04-24)
 
 ### New Experimental Feature
