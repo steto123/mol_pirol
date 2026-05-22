@@ -224,27 +224,41 @@ def generate_boltzmann_conformers(mol):
     if m.GetNumConformers() == 0:
         if AllChem.EmbedMolecule(m, randomSeed=42) == -1:
             AllChem.Compute2DCoords(m)
-        AllChem.MMFFOptimizeMolecule(m)
+        try:
+            AllChem.MMFFOptimizeMolecule(m)
+        except Exception:
+            pass
         
     cids = AllChem.EmbedMultipleConfs(m, numConfs=10, randomSeed=42, pruneRmsThresh=0.5)
     
     energies = []
     for cid in cids:
-        ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
-        if ff:
-            ff.Initialize()
-            ff.Minimize()
-            energies.append((cid, ff.CalcEnergy()))
+        try:
+            ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
+            if ff:
+                ff.Initialize()
+                ff.Minimize()
+                energies.append((cid, ff.CalcEnergy()))
+        except Exception:
+            pass
             
     if not energies:
-        ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m))
-        if ff:
-            ff.Initialize()
-            ff.Minimize()
-            e = ff.CalcEnergy()
+        if m.GetNumConformers() == 0:
+            cid = AllChem.Compute2DCoords(m)
         else:
-            e = 0.0
-        return m, {0: 1.0}, {0: e}
+            cid = m.GetConformer(0).GetId()
+        
+        e = 0.0
+        try:
+            ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
+            if ff:
+                ff.Initialize()
+                ff.Minimize()
+                e = ff.CalcEnergy()
+        except Exception:
+            pass
+            
+        return m, {cid: 1.0}, {cid: e}
         
     min_e = min([e for c, e in energies])
     RT = 0.001987 * 298.15
@@ -498,7 +512,7 @@ class CalculationWorker(QThread):
             # cis/trans or axial/equatorial positions that are topologically identical.
             # We use a tolerant check (0.4A) to avoid over-sensitivity to conformational tilts.
             if m_3d.GetNumConformers() > 0:
-                best_cid = sorted_confs[0][0] if sorted_confs else 0
+                best_cid = sorted_confs[0][0] if sorted_confs else m_3d.GetConformer().GetId()
                 conf = m_3d.GetConformer(best_cid)
                 num_at = mol.GetNumAtoms()
                 
