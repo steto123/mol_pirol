@@ -224,27 +224,41 @@ def generate_boltzmann_conformers(mol):
     if m.GetNumConformers() == 0:
         if AllChem.EmbedMolecule(m, randomSeed=42) == -1:
             AllChem.Compute2DCoords(m)
-        AllChem.MMFFOptimizeMolecule(m)
+        try:
+            AllChem.MMFFOptimizeMolecule(m)
+        except Exception:
+            pass
         
     cids = AllChem.EmbedMultipleConfs(m, numConfs=10, randomSeed=42, pruneRmsThresh=0.5)
     
     energies = []
     for cid in cids:
-        ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
-        if ff:
-            ff.Initialize()
-            ff.Minimize()
-            energies.append((cid, ff.CalcEnergy()))
+        try:
+            ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
+            if ff:
+                ff.Initialize()
+                ff.Minimize()
+                energies.append((cid, ff.CalcEnergy()))
+        except Exception:
+            pass
             
     if not energies:
-        ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m))
-        if ff:
-            ff.Initialize()
-            ff.Minimize()
-            e = ff.CalcEnergy()
+        if m.GetNumConformers() == 0:
+            cid = AllChem.Compute2DCoords(m)
         else:
-            e = 0.0
-        return m, {0: 1.0}, {0: e}
+            cid = m.GetConformer(0).GetId()
+        
+        e = 0.0
+        try:
+            ff = AllChem.MMFFGetMoleculeForceField(m, AllChem.MMFFGetMoleculeProperties(m), confId=cid)
+            if ff:
+                ff.Initialize()
+                ff.Minimize()
+                e = ff.CalcEnergy()
+        except Exception:
+            pass
+            
+        return m, {cid: 1.0}, {cid: e}
         
     min_e = min([e for c, e in energies])
     RT = 0.001987 * 298.15
@@ -498,7 +512,7 @@ class CalculationWorker(QThread):
             # cis/trans or axial/equatorial positions that are topologically identical.
             # We use a tolerant check (0.4A) to avoid over-sensitivity to conformational tilts.
             if m_3d.GetNumConformers() > 0:
-                best_cid = sorted_confs[0][0] if sorted_confs else 0
+                best_cid = sorted_confs[0][0] if sorted_confs else m_3d.GetConformer().GetId()
                 conf = m_3d.GetConformer(best_cid)
                 num_at = mol.GetNumAtoms()
                 
@@ -775,6 +789,12 @@ class NMRApp(QMainWindow):
         self.warning_label.setStyleSheet("color: red;")
         self.warning_label.setVisible(False)
         main_layout.addWidget(self.warning_label)
+        
+        self.warning_label_est = QLabel("Warning: EST-NMR is only trained for elements H, C, N, O, F, S, Cl, Br.")
+        self.warning_label_est.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.warning_label_est.setStyleSheet("color: orange;")
+        self.warning_label_est.setVisible(False)
+        main_layout.addWidget(self.warning_label_est)
         
         self.mae_label = QLabel("")
         self.mae_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
@@ -1127,6 +1147,13 @@ class NMRApp(QMainWindow):
             self.warning_label.setVisible(True)
         else:
             self.warning_label.setVisible(False)
+            
+        # EST-NMR element check: H, C, N, O, F, S, Cl, Br
+        allowed_elements_est = {1, 6, 7, 8, 9, 16, 17, 35}
+        if molecule_elements - allowed_elements_est:
+            self.warning_label_est.setVisible(True)
+        else:
+            self.warning_label_est.setVisible(False)
             
         try:
             svg_bytes = draw_annotated_mol(mol)
