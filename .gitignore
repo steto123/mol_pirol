@@ -46,3 +46,8 @@ scratch_*.py
 
 # Git
 *.orig
+
+# Private / interne Projektdateien (nicht fuer das oeffentliche Repo)
+Protokoll der Veränderungen.md
+ToDo.md
+ideen.md
