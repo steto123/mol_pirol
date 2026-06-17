@@ -96,44 +96,94 @@ def generate_3d_structure(mol):
 
 def calculate_symmetry_ranks(mol, m_3d=None):
     """
-    Hybrid ranking algorithm: Topological (RDKit) + 3D Spatial Refinement.
+    Hybrid Fragment-Based Symmetry Ranking.
+
+    Two atoms receive the same rank if:
+    (1) they share the same topological rank (CanonicalRankAtoms, breakTies=False)
+    AND
+    (2) they have identical distance profiles within their rigid fragment
+        (molecule cut at all rotatable bonds, idealized 2D coords per fragment).
+
+    This correctly keeps homotopic rotating groups united (e.g. tert-butyl methyls,
+    ortho/meta on phenyl) while separating diastereotopic groups in rigid
+    scaffolds (e.g. cis/trans, dithiolane CH2).
+
+    Note: m_3d is accepted for API compatibility but no longer used.
     """
-    # 1. Base topological ranking with chirality
+    from collections import defaultdict
+
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
     base_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
-    
-    # 2. Spatial refinement if 3D structure is available
-    if m_3d and m_3d.GetNumConformers() > 0:
-        conf = m_3d.GetConformer(0)
-        num_at = mol.GetNumAtoms()
-        
-        # Pre-calculate distance sets for all atoms
-        all_dist_sets = []
-        for i in range(num_at):
-            d_set = sorted([conf.GetAtomPosition(i).Distance(conf.GetAtomPosition(j)) 
-                           for j in range(num_at) if i != j])
-            all_dist_sets.append(d_set)
-        
-        # Group atoms that are topologically equivalent AND spatially similar (0.4A tolerance)
-        sym_ranks = [-1] * num_at
-        next_rank = 0
-        for i in range(num_at):
-            if sym_ranks[i] == -1:
-                sym_ranks[i] = next_rank
-                for j in range(i + 1, num_at):
-                    if sym_ranks[j] == -1 and base_ranks[i] == base_ranks[j]:
-                        # Check spatial similarity with a 0.4A tolerance
-                        is_similar = True
-                        for d1, d2 in zip(all_dist_sets[i], all_dist_sets[j]):
-                            if abs(d1 - d2) > 0.4:
-                                is_similar = False
-                                break
-                        if is_similar:
-                            sym_ranks[j] = next_rank
-                next_rank += 1
-        return sym_ranks
+    num_at = mol.GetNumAtoms()
+
+    # 1. Find rotatable bonds (single, non-ring, between non-terminal heavy atoms)
+    rot_smarts = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
+    rot_matches = mol.GetSubstructMatches(rot_smarts)
+    rot_bonds = [mol.GetBondBetweenAtoms(a, b).GetIdx() for a, b in rot_matches]
+
+    # 2. Cut molecule into rigid fragments
+    if rot_bonds:
+        frags_mol = Chem.FragmentOnBonds(mol, rot_bonds)
     else:
-        return base_ranks
+        frags_mol = Chem.Mol(mol)
+
+    frag_indices = Chem.GetMolFrags(frags_mol, asMols=False)
+    frags_mols   = Chem.GetMolFrags(frags_mol, asMols=True, sanitizeFrags=False)
+
+    # 3. Compute idealized 2D coords for each fragment
+    frag_confs = []
+    for frag in frags_mols:
+        try:
+            AllChem.Compute2DCoords(frag)
+            frag_confs.append(frag.GetConformer())
+        except Exception:
+            frag_confs.append(None)
+
+    # 4. Group atoms by topological base rank, then refine via fragment geometry
+    rank_groups = defaultdict(list)
+    for i, r in enumerate(base_ranks):
+        rank_groups[r].append(i)
+
+    final_ranks = [-1] * num_at
+    next_rank   = 0
+
+    for r in sorted(rank_groups.keys()):
+        atoms = rank_groups[r]
+        if len(atoms) == 1:
+            final_ranks[atoms[0]] = next_rank
+            next_rank += 1
+            continue
+
+        # Build distance-profile signature for each atom within its rigid fragment
+        signatures = {}
+        for a_idx in atoms:
+            for f_idx, f_atoms in enumerate(frag_indices):
+                if a_idx in f_atoms:
+                    frag_mol  = frags_mols[f_idx]
+                    conf      = frag_confs[f_idx]
+                    local_idx = f_atoms.index(a_idx)
+                    if conf is not None:
+                        pos   = conf.GetAtomPosition(local_idx)
+                        dists = tuple(sorted(
+                            round(pos.Distance(conf.GetAtomPosition(k)), 3)
+                            for k in range(frag_mol.GetNumAtoms())
+                        ))
+                        signatures[a_idx] = dists
+                    else:
+                        signatures[a_idx] = (0,)
+                    break
+
+        # Group by signature, assign ranks deterministically
+        sig_groups = defaultdict(list)
+        for a_idx, sig in signatures.items():
+            sig_groups[sig].append(a_idx)
+
+        for sig in sorted(sig_groups.keys()):
+            for a_idx in sig_groups[sig]:
+                final_ranks[a_idx] = next_rank
+            next_rank += 1
+
+    return final_ranks
 
 def draw_2d_svg(mol, highlight_indices=None):
     tm_full = Chem.Mol(mol)

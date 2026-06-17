@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView, QSplitter,
                              QGraphicsView, QGraphicsScene, QStackedWidget, QCheckBox, QTabWidget,
                              QFileDialog, QComboBox, QDialog)
-from PyQt5.QtCore import Qt, QDateTime, QUrl, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QDateTime, QUrl, QThread, pyqtSignal, QEvent, QTimer, QRect, QPoint
 try:
     import matplotlib
     matplotlib.use('Qt5Agg')
@@ -93,7 +93,8 @@ HTML_3DMOL = """
 </html>
 """
 from PyQt5.QtSvg import QSvgWidget, QGraphicsSvgItem, QSvgRenderer
-from PyQt5.QtGui import QFont, QColor, QPainter, QIcon
+from PyQt5.QtGui import (QFont, QColor, QPainter, QIcon, QPixmap, QPen, QBrush,
+                         QLinearGradient, QRadialGradient, QFontDatabase)
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
@@ -505,43 +506,86 @@ class CalculationWorker(QThread):
             pred_dcode = predict_dcode_boltzmann(m_3d, b_weights, codes_df) if codes_df is not None else {}
             
             self.progress_status.emit("Calculating symmetry ranks...")
+            # --- Hybrid Fragment-Based Symmetry Ranking ---
+            # Two atoms receive the same rank if:
+            # (1) they share the same topological rank (CanonicalRankAtoms, breakTies=False)
+            # AND
+            # (2) they have identical distance profiles within their rigid fragment
+            #     (molecule cut at all rotatable bonds, idealized 2D coords per fragment).
+            # This correctly keeps homotopic rotating groups united (e.g. tert-butyl methyls,
+            # ortho/meta on phenyl) while separating diastereotopic groups in rigid
+            # scaffolds (e.g. cis/trans, dithiolane CH2).
             Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
             base_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True))
-            
-            # Refine ranks using spatial distances from the 3D structure to distinguish 
-            # cis/trans or axial/equatorial positions that are topologically identical.
-            # We use a tolerant check (0.4A) to avoid over-sensitivity to conformational tilts.
-            if m_3d.GetNumConformers() > 0:
-                best_cid = sorted_confs[0][0] if sorted_confs else m_3d.GetConformer().GetId()
-                conf = m_3d.GetConformer(best_cid)
-                num_at = mol.GetNumAtoms()
-                
-                # Pre-calculate distance sets for all atoms
-                all_dist_sets = []
-                for i in range(num_at):
-                    d_set = sorted([conf.GetAtomPosition(i).Distance(conf.GetAtomPosition(j)) 
-                                   for j in range(num_at) if i != j])
-                    all_dist_sets.append(d_set)
-                
-                # Group atoms that are topologically equivalent AND spatially similar
-                sym_ranks = [-1] * num_at
-                next_rank = 0
-                for i in range(num_at):
-                    if sym_ranks[i] == -1:
-                        sym_ranks[i] = next_rank
-                        for j in range(i + 1, num_at):
-                            if sym_ranks[j] == -1 and base_ranks[i] == base_ranks[j]:
-                                # Check spatial similarity with a 0.4A tolerance
-                                is_similar = True
-                                for d1, d2 in zip(all_dist_sets[i], all_dist_sets[j]):
-                                    if abs(d1 - d2) > 0.4:
-                                        is_similar = False
-                                        break
-                                if is_similar:
-                                    sym_ranks[j] = next_rank
-                        next_rank += 1
+            num_at = mol.GetNumAtoms()
+
+            # 1. Find rotatable bonds (single, non-ring, between non-terminal heavy atoms)
+            rot_smarts = Chem.MolFromSmarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
+            rot_matches = mol.GetSubstructMatches(rot_smarts)
+            rot_bonds = [mol.GetBondBetweenAtoms(a, b).GetIdx() for a, b in rot_matches]
+
+            # 2. Cut molecule into rigid fragments
+            if rot_bonds:
+                frags_mol = Chem.FragmentOnBonds(mol, rot_bonds)
             else:
-                sym_ranks = base_ranks
+                frags_mol = Chem.Mol(mol)
+
+            frag_indices = Chem.GetMolFrags(frags_mol, asMols=False)
+            frags_mols   = Chem.GetMolFrags(frags_mol, asMols=True, sanitizeFrags=False)
+
+            # 3. Compute idealized 2D coords for each fragment
+            frag_confs = []
+            for frag in frags_mols:
+                try:
+                    AllChem.Compute2DCoords(frag)
+                    frag_confs.append(frag.GetConformer())
+                except Exception:
+                    frag_confs.append(None)
+
+            # 4. Group atoms by topological base rank, then refine via fragment geometry
+            from collections import defaultdict as _defaultdict
+            rank_groups = _defaultdict(list)
+            for i, r in enumerate(base_ranks):
+                rank_groups[r].append(i)
+
+            sym_ranks  = [-1] * num_at
+            next_rank  = 0
+
+            for r in sorted(rank_groups.keys()):
+                atoms = rank_groups[r]
+                if len(atoms) == 1:
+                    sym_ranks[atoms[0]] = next_rank
+                    next_rank += 1
+                    continue
+
+                # Build distance-profile signature for each atom within its fragment
+                signatures = {}
+                for a_idx in atoms:
+                    for f_idx, f_atoms in enumerate(frag_indices):
+                        if a_idx in f_atoms:
+                            frag_mol   = frags_mols[f_idx]
+                            conf       = frag_confs[f_idx]
+                            local_idx  = f_atoms.index(a_idx)
+                            if conf is not None:
+                                pos   = conf.GetAtomPosition(local_idx)
+                                dists = tuple(sorted(
+                                    round(pos.Distance(conf.GetAtomPosition(k)), 3)
+                                    for k in range(frag_mol.GetNumAtoms())
+                                ))
+                                signatures[a_idx] = dists
+                            else:
+                                signatures[a_idx] = (0,)
+                            break
+
+                # Group by signature, assign ranks deterministically
+                sig_groups = _defaultdict(list)
+                for a_idx, sig in signatures.items():
+                    sig_groups[sig].append(a_idx)
+
+                for sig in sorted(sig_groups.keys()):
+                    for a_idx in sig_groups[sig]:
+                        sym_ranks[a_idx] = next_rank
+                    next_rank += 1
             
             if self.use_symmetry:
                 self.progress_status.emit("Applying symmetry averaging...")
@@ -619,16 +663,193 @@ class KetcherDialog(QDialog):
             self.smiles = title[7:]
             self.accept()
 
+# ---------------------------------------------------------------------------
+# Splash Screen
+# ---------------------------------------------------------------------------
+
+class NMRSplashScreen(QWidget):
+    """
+    Custom splash screen mit Glasmorphism-Ästhetik.
+    Zeigt App-Icon, Titel, Version, Status-Text und animierten Fortschrittsbalken.
+    """
+
+    def __init__(self, icon_path: str = ""):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SplashScreen
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        self._W, self._H = 560, 340
+        self.resize(self._W, self._H)
+        self._center_on_screen()
+
+        # Icon laden
+        self._icon_pixmap = None
+        if icon_path and os.path.exists(icon_path):
+            raw = QPixmap(icon_path)
+            if not raw.isNull():
+                self._icon_pixmap = raw.scaled(
+                    96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+
+        # Status-Text und Fortschritt
+        self._status = "Initializing…"
+        self._progress = 0          # 0–100
+        self._dot_frame = 0         # für animierte Punkte
+
+        # Animations-Timer
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick_anim)
+        self._anim_timer.start(400)
+
+    def _center_on_screen(self):
+        from PyQt5.QtWidgets import QDesktopWidget
+        screen = QDesktopWidget().screenGeometry()
+        self.move(
+            (screen.width()  - self._W) // 2,
+            (screen.height() - self._H) // 2,
+        )
+
+    def _tick_anim(self):
+        self._dot_frame = (self._dot_frame + 1) % 4
+        self.update()
+
+    def set_status(self, text: str, progress: int = -1):
+        """Aktualisiert den Status-Text und optional den Fortschritt (0–100)."""
+        self._status = text
+        if progress >= 0:
+            self._progress = min(100, progress)
+        self.update()
+        QApplication.processEvents()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        W, H = self._W, self._H
+        radius = 18
+
+        # --- Hintergrund-Gradient (dunkelblau → mittelblau) ---
+        bg = QLinearGradient(0, 0, W, H)
+        bg.setColorAt(0.0, QColor(10,  20,  50))
+        bg.setColorAt(0.5, QColor(15,  35,  80))
+        bg.setColorAt(1.0, QColor( 8,  18,  45))
+        p.setBrush(QBrush(bg))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, W, H, radius, radius)
+
+        # --- Glas-Glanz oben ---
+        gloss = QLinearGradient(0, 0, 0, H * 0.45)
+        gloss.setColorAt(0.0, QColor(255, 255, 255, 28))
+        gloss.setColorAt(1.0, QColor(255, 255, 255,  0))
+        p.setBrush(QBrush(gloss))
+        p.drawRoundedRect(0, 0, W, int(H * 0.45), radius, radius)
+
+        # --- Leuchtender Cyan-Schimmer links ---
+        glow = QRadialGradient(100, H // 2, 180)
+        glow.setColorAt(0.0, QColor(0, 200, 255, 55))
+        glow.setColorAt(1.0, QColor(0, 200, 255,  0))
+        p.setBrush(QBrush(glow))
+        p.drawRoundedRect(0, 0, W, H, radius, radius)
+
+        # --- Rand ---
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(60, 130, 200, 120), 1.2))
+        p.drawRoundedRect(1, 1, W - 2, H - 2, radius, radius)
+
+        # --- Icon ---
+        icon_x, icon_y = 36, 36
+        if self._icon_pixmap:
+            p.drawPixmap(icon_x, icon_y, self._icon_pixmap)
+            icon_x += 96 + 20
+        else:
+            icon_x = 36
+
+        # --- Titel ---
+        p.setPen(QPen(QColor(220, 240, 255)))
+        title_font = QFont("Segoe UI", 22, QFont.Bold)
+        p.setFont(title_font)
+        p.drawText(icon_x, 62, "¹³C-NMR Predictor")
+
+        # --- Untertitel ---
+        sub_font = QFont("Segoe UI", 10)
+        p.setFont(sub_font)
+        p.setPen(QPen(QColor(100, 180, 255, 200)))
+        p.drawText(icon_x, 86, "CASCADE  ·  EST-NMR  ·  DCode")
+
+        # --- Trennlinie ---
+        p.setPen(QPen(QColor(60, 130, 200, 80), 1))
+        p.drawLine(36, 148, W - 36, 148)
+
+        # --- Features ---
+        feat_font = QFont("Segoe UI", 9)
+        p.setFont(feat_font)
+        p.setPen(QPen(QColor(140, 200, 240, 180)))
+        features = [
+            "⬡  Graph Neural Network (CASCADE)",
+            "⚛  Equivariant ML Model (EST-NMR)",
+            "📐  Fragment Symmetry Averaging",
+        ]
+        for i, feat in enumerate(features):
+            p.drawText(48, 172 + i * 22, feat)
+
+        # --- Fortschrittsbalken ---
+        bar_x, bar_y = 36, H - 64
+        bar_w, bar_h = W - 72, 5
+        # Hintergrund
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, 20)))
+        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
+        # Füllstand
+        filled_w = int(bar_w * self._progress / 100)
+        if filled_w > 0:
+            bar_grad = QLinearGradient(bar_x, 0, bar_x + filled_w, 0)
+            bar_grad.setColorAt(0.0, QColor( 0, 180, 255))
+            bar_grad.setColorAt(1.0, QColor( 0, 230, 200))
+            p.setBrush(QBrush(bar_grad))
+            p.drawRoundedRect(bar_x, bar_y, filled_w, bar_h, 3, 3)
+
+        # --- Status-Text mit animierten Punkten ---
+        dots = "." * self._dot_frame
+        status_text = self._status.rstrip(".…") + dots
+        st_font = QFont("Segoe UI", 9)
+        p.setFont(st_font)
+        p.setPen(QPen(QColor(160, 210, 255, 210)))
+        p.drawText(bar_x, H - 36, status_text)
+
+        # --- Version (rechts unten) ---
+        p.setPen(QPen(QColor(80, 120, 180, 150)))
+        ver_font = QFont("Segoe UI", 8)
+        p.setFont(ver_font)
+        ver_text = "v2.0  |  © 2026"
+        fm = p.fontMetrics()
+        p.drawText(W - fm.horizontalAdvance(ver_text) - 20, H - 36, ver_text)
+
+        p.end()
+
+    def finish(self, main_window):
+        """Stoppt Animation und schließt den Splash."""
+        self._anim_timer.stop()
+        self.close()
+
+
 class NMRApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NMR 13C Prediction App (Windows 11)")
+        self.setWindowTitle("NMR 13C Prediction App")
         self.resize(1400, 900)
         
-        # Set Application Icon
-        icon_path = os.path.join(os.path.dirname(__file__), "app_icon.png")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        # App-Icon setzen (.ico hat beste Windows-Taskbar-Integration)
+        ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        png_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.png")
+        icon_file = ico_path if os.path.exists(ico_path) else png_path
+        if os.path.exists(icon_file):
+            app_icon = QIcon(icon_file)
+            self.setWindowIcon(app_icon)
+            QApplication.instance().setWindowIcon(app_icon)
             
         self.setup_ui()
 
@@ -735,6 +956,7 @@ class NMRApp(QMainWindow):
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setFont(QFont("Segoe UI", 10))
         self.table.itemSelectionChanged.connect(self.on_table_selection)
+        self.table.viewport().installEventFilter(self)  # detect clicks in empty area
         tabs.addTab(self.table, "Results")
         
         # Tab 2: Konformere
@@ -984,6 +1206,18 @@ class NMRApp(QMainWindow):
                         pass
         except ValueError:
             pass
+
+    def eventFilter(self, source, event):
+        """Clear selection (and highlight) when the user clicks into an empty area
+        of the results table – i.e. below the last row or to the right of all columns."""
+        if (
+            source is self.table.viewport()
+            and event.type() == QEvent.MouseButtonPress
+        ):
+            index = self.table.indexAt(event.pos())
+            if not index.isValid():
+                self.table.clearSelection()   # triggers on_table_selection → update_highlight([])
+        return super().eventFilter(source, event)
 
     def on_table_selection(self):
         selected_items = self.table.selectedItems()
@@ -1415,7 +1649,35 @@ class NMRApp(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    app.setStyle("Fusion") # Sieht moderner aus auf Windows
+    app.setStyle("Fusion")
+
+    # App-Icon für die gesamte Applikation (Taskleiste, Alt+Tab)
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _ico  = os.path.join(_base, "app_icon.ico")
+    _png  = os.path.join(_base, "app_icon.png")
+    _icon_file = _ico if os.path.exists(_ico) else _png
+    if os.path.exists(_icon_file):
+        app.setWindowIcon(QIcon(_icon_file))
+
+    # --- Splash Screen anzeigen ---
+    splash = NMRSplashScreen(icon_path=_png if os.path.exists(_png) else "")
+    splash.show()
+    app.processEvents()
+
+    splash.set_status("Loading Qt & UI", 10)
+    app.processEvents()
+
+    # Hauptfenster erzeugen (lädt noch keine Modelle)
+    splash.set_status("Building main window", 30)
     window = NMRApp()
-    window.show()
+
+    splash.set_status("Preparing renderer", 60)
+    app.processEvents()
+
+    splash.set_status("Ready – click Calculate to load models", 100)
+    app.processEvents()
+
+    # Kurz warten, damit der Splash sichtbar bleibt
+    QTimer.singleShot(1400, lambda: (splash.finish(window), window.show()))
+
     sys.exit(app.exec_())

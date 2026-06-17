@@ -1,6 +1,40 @@
 # Release Notes - NMR 13C Prediction App
 
+## Version 0.5 (2026-06-17)
+
+### Symmetrie-Ranking: Grundlegend überarbeiteter Algorithmus
+
+* **Neuer Fragment-basierter Hybrid-Algorithmus** (`symmetry_ranking.py`, `nmr_app.py`, `symmetry_tester.py`):
+    * **Vorher**: Der Algorithmus analysierte Distanzprofile über das gesamte MMFF94-3D-Konformer. Das führte bei rotierenden Gruppen (tert-Butyl, Phenyl) zu fehlerhafter Trennung und war konformerabhängig.
+    * **Jetzt**: Das Molekül wird an allen rotierbaren Bindungen in starre Teilfragmente zerschnitten. Pro Fragment werden **idealisierte 2D-Koordinaten** berechnet und die Distanzprofile innerhalb des Fragments verglichen. Dadurch:
+        * Rotierende, homotope Gruppen (Phenyl, tert-Butyl) → **korrekt vereint** ✅
+        * Cis/Trans-Isomere, diastereotope axiale/äquatoriale Positionen → **korrekt getrennt** ✅
+        * Kein 3D-Konformer mehr nötig → **schneller** ✅
+    * Validiert mit Benzol (1 Gruppe), tert-Butylmethan (2), Naphthalin (3), Cis/Trans-Methylen-Systemen.
+
+### Dokumentation
+
+* **`Documentation.md` Abschnitt 2.5** vollständig neu geschrieben: Detaillierter Flowchart, Algorithmus-Vergleichstabelle (alt vs. neu), Testfall-Tabelle, Beschreibung der UI-Optionen.
+
+### Packaging & Distribution
+
+* **`FULL_REBUILD_INSTALLER.bat`** grundlegend überarbeitet:
+    * Prüft Icons (`app_icon.ico`, `app_icon.png`) vor dem Start.
+    * Prüft alle Pflichtdateien (inkl. `symmetry_ranking.py`, `symmetry_tester.py`).
+    * Prüft Inno Setup 6 Installation.
+    * Zeigt nach Erfolg die erstellte EXE mit Dateigröße an.
+* **`build_installer.iss`** auf Version `0.5` aktualisiert:
+    * `symmetry_ranking.py` und `symmetry_tester.py` neu hinzugefügt.
+    * `Start_Symmetry_Tester.bat` wird mitinstalliert.
+    * Beide Icon-Dateien (`app_icon.ico`, `app_icon.png`) explizit eingebunden.
+    * Der Installer selbst trägt jetzt das App-Icon (`SetupIconFile=app_icon.ico`).
+    * Startmenü-Eintrag für den Symmetry Tester hinzugefügt.
+    * `UninstallDisplayIcon` gesetzt.
+
+---
+
 ## Version 0.4 (2026-05-05)
+
 
 ### Bug Fixes
 * **Dark Mode Table Readability**: Fixed poor contrast in the Results table when Dark Mode was active. The symmetry-rank background colors are now consistently light-toned (HSV `v=0.88–0.95`) in both light and dark mode, and all table cell text is now explicitly set to black (`Qt.black`). This eliminates the previous issue of white text on light-pastel backgrounds. The Exp. Data column retains its dark-green color (`#1e7e34`).

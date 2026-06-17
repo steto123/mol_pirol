@@ -71,20 +71,80 @@ Die `predict_dcode_boltzmann`-Funktion verwendet einen proprietären, neu integr
 ### 2.4 Spannweite als Qualitätssiegel
 Für jedes C-Atom vergleicht das Skript die berechneten Werte aller 3 Modelle. Die `"Spannweite"` wird als `Maximum(Shifts) - Minimum(Shifts)` berechnet. Liegt sie höher als 5 ppm, wird die Tabelle rot markiert. Dies weist den Experten auf herausfordernde stereochemische Bereiche, anormale Elektronegativitäten oder RDKit-Geometriefehler hin.
 
-## 2.5 Symmetrie-Mittelung (Experimentelles Feature)
-Die Applikation nutzt ein hybrides Verfahren zur Identifizierung chemisch äquivalenter Atome, um die Vorhersagequalität zu steigern.
+## 2.5 Symmetrie-Ranking und -Mittelung
 
-*   **Hybrid-Ansatz**:
-    1.  **Topologisches Ranking**: Zuerst wird via `RDKit.Chem.CanonicalRankAtoms` ein Basis-Ranking erstellt, das Chiralität und stereochemische Zentren berücksichtigt.
-    2.  **Räumliche Verfeinerung (3D)**: Da rein topologische Verfahren oft Probleme haben, räumliche Unterschiede wie Cis/Trans-Positionen oder Axial/Äquatorial-Stellungen in Ringen zu unterscheiden (wenn diese topologisch identisch erscheinen), wird eine zusätzliche geometrische Analyse durchgeführt.
-*   **Funktionsweise der 3D-Verfeinerung**:
-    *   Für jedes Atom wird ein "geometrischer Fingerabdruck" basierend auf den Distanzen zu allen anderen Atomen in der stabilsten 3D-Konformation berechnet.
-    *   Atome werden nur dann als symmetrisch äquivalent gruppiert, wenn sie sowohl topologisch gleich sind als auch räumlich innerhalb einer **Toleranz von 0,4 Å** liegen.
-    *   **Nutzen**: Dies ermöglicht es, rotierende Gruppen (wie Phenylringe) trotz minimaler 3D-Verzerrungen zusammenzufassen, während starre geometrische Isomere (Cis/Trans) zuverlässig unterschieden werden.
-*   **Symmetry Average Option**: Über die Checkbox `"Symmetry Average"` im UI kann gesteuert werden, ob die Vorhersagewerte für äquivalente Atome gemittelt werden sollen. 
-    *   *Aktiviert*: Alle Atome desselben Rangs erhalten denselben gemittelten Shift-Wert. Dies entspricht der chemischen Erwartung für frei rotierende oder symmetrische Moleküle in Lösung.
-    *   *Deaktiviert*: Jedes Atom behält seinen individuellen Vorhersagewert (nützlich zur Analyse von Geometrie-Effekten oder Instabilitäten der Modelle).
-*   **Hinweis (Experimentell)**: Da die Symmetrie-Erkennung von der Qualität der initialen 3D-Einbettung (MMFF94) abhängt, kann es in seltenen Fällen bei sehr flexiblen Molekülen zu einer Über- oder Untersegmentierung kommen. Die Ergebnisse sollten daher im Einzelfall kritisch geprüft werden. Der Rang wird zur Kontrolle in der Spalte `"Sym. Rank"` angezeigt.
+### 2.5.1 Algorithmus: Fragment-basiertes Hybrid-Ranking (ab v0.5 / 16.6.2026)
+
+Die Applikation verwendet einen **topologisch-geometrischen Fragment-Algorithmus**, um chemisch äquivalente Atome zuverlässig zu identifizieren. Implementiert in [`symmetry_ranking.py`](symmetry_ranking.py) (Funktion `calculate_symmetry_ranks`).
+
+#### Schritt-für-Schritt-Ablauf
+
+```mermaid
+flowchart TD
+    A["SMILES-Eingabe"] --> B["RDKit: AssignStereochemistry\n+ CanonicalRankAtoms(breakTies=False,\nincludeChirality=True)"]
+    B --> C["Basis-Ränge (topologisch)"]
+    C --> D["Rotierbare Bindungen finden\n(SMARTS: Einfachbindungen,\nnicht-Ring, zwischen Schweratomen)"]
+    D --> E["FragmentOnBonds:\nMolekül in starre Teilstücke zerschneiden"]
+    E --> F["Compute2DCoords für\njedes starre Fragment\n(idealisierte Geometrie)"]
+    F --> G["Pro Atom:\nDistanzprofil zu allen\nAtomen des eigenen Fragments"]
+    G --> H{"Topologisch gleiche Atome:\nDistanzprofile ähnlich?"}
+    H -- Ja --> I["Gleiches Symmetrie-Rang\n(Atom ist äquivalent)"]
+    H -- Nein --> J["Verschiedene Ränge\n(Atom ist diastereotop)"]
+    I --> K["Finale Rang-Liste\n(normiert: 0, 1, 2, ...)"]
+    J --> K
+```
+
+#### Warum Fragment-basiert, nicht 3D-Konformer?
+
+| Eigenschaft | Alter Algorithmus (3D-Distanzprofil) | Neuer Algorithmus (Fragment-2D) |
+|:---|:---:|:---:|
+| **Basis** | Gesamtes MMFF94-3D-Konformer | Starre Teilfragmente (2D-idealisiert) |
+| **3D-Konformer nötig** | ✅ Ja | ❌ Nein |
+| **tert-Butyl / Phenyl (rotierende Gruppen)** | ⚠️ Konnte fälschlich trennen | ✅ Korrekt vereint |
+| **Cis/Trans-Isomere, Diastereotope Positionen** | ⚠️ Abhängig von Konformerqualität | ✅ Geometrisch stabil getrennt |
+| **Rechenzeit** | Langsam | Schnell |
+
+**Kernidee**: Statt das gesamte Molekül in 3D zu analysieren, schneidet der Algorithmus alle rotierbaren Bindungen durch und berechnet für jedes entstehende starre Fragment **idealisierte 2D-Koordinaten**. Innerhalb dieses Fragments werden die Distanzprofile der topologisch-gleichen Kandidatenatome verglichen:
+
+- **Rotierende Gruppen** (z.B. ortho-C im Phenylring, Methyle im tert-Butyl): Sie liegen im gleichen symmetrischen Fragment. Ihre Distanzprofile zu den Nachbaratomen sind identisch → werden korrekt **vereint**.
+- **Diastereotope Gruppen** (z.B. Cis/Trans-Methyle an einer Doppelbindung, axial/äquatorial in Ringen): Sie liegen im gleichen starren Fragment, haben aber wegen des Rings oder der Doppelbindungsgeometrie **asymmetrische Abstände** zum Rest des Fragments → werden korrekt **getrennt**.
+
+#### Validierte Testfälle
+
+| Molekül | SMILES | Erwartet | Ergebnis |
+|:---|:---|:---:|:---:|
+| Benzol | `c1ccccc1` | 1 Gruppe | ✅ 1 |
+| tert-Butylmethan | `CC(C)(C)C` | 2 Gruppen (Quart-C, 3×Methyl) | ✅ 2 |
+| Naphthalin | `c1ccc2ccccc2c1` | 3 Gruppen | ✅ 3 |
+| 1-Chlor-2-methylprop-1-en | `CC(=CCl)C` (cis/trans-Methyle) | 3 Gruppen | ✅ 3 |
+| Dithiolan-Derivate (axial/äq.) | diverse | diastereotop getrennt | ✅ |
+
+---
+
+### 2.5.2 Einfaches vs. Hybrides Ranking
+
+Die Datei [`symmetry_ranking.py`](symmetry_ranking.py) enthält zwei Ranking-Varianten, die über `symmetry_tester.py` auch standalone genutzt werden können:
+
+| Funktion | Beschreibung |
+|:---|:---|
+| `calculate_simple_ranks(mol)` | Nur `CanonicalRankAtoms(breakTies=False)` – schnell, ohne geometrische Verfeinerung |
+| `calculate_symmetry_ranks(mol)` | **Fragment-basierter Hybrid-Algorithmus** – Standard in der NMR App |
+| `plot_comparison_result(smiles)` | Zeigt beide Rankings nebeneinander (Jupyter oder SVG-Dateien) |
+
+---
+
+### 2.5.3 Symmetrie-Mittelung im UI
+
+Über die Checkbox **`"Symmetry Average"`** im Eingabebereich kann gesteuert werden, ob die Vorhersagewerte für äquivalente Atome gemittelt werden sollen:
+
+| Modus | Verhalten | Anwendungsfall |
+|:---|:---|:---|
+| **Aktiviert** (Standard) | Alle Atome desselben Rangs erhalten den gemittelten Shift-Wert aller Modelle | Entspricht der chemischen Erwartung für frei rotierende / symmetrische Moleküle in Lösung |
+| **Deaktiviert** | Jedes Atom behält seinen individuellen Vorhersagewert | Analyse von Geometrie-Effekten oder Modell-Instabilitäten |
+
+Der berechnete Rang wird zur Kontrolle in der Tabellenspalte **`"Sym. Rank"`** angezeigt. Atome desselben Rangs erhalten in der Tabelle dieselbe Hintergrundfarbe (Pastell, Goldener-Winkel-Farbverteilung).
+
+> **Hinweis**: Die Symmetrie-Erkennung basiert auf der Graphtopologie und idealisierten 2D-Fragmentkoordinaten. Sie ist robust gegenüber Konformerfluktuationen. In sehr seltenen Grenzfällen (extrem gespannte Ringsysteme ohne klare Fragmentierung) kann es zu unerwarteten Gruppierungen kommen – der Rang sollte dann manuell überprüft werden.
 
 ## 3. Zuordnung experimenteller Verschiebungen (Auto-MAE)
 
