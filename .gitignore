@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Portable Python environment (too large for git, distribute as Release asset)
+portable_python/
+NMR_App_Portable/
+
+# ML Model weights (too large for git - >100 MB limit)
+# models/ folder structure is kept, but heavy files are excluded
+models/cascade/trained_model/best_model.hdf5
+models/cascade/trained_model/best_model_H_DFTNN.hdf5
+models/DLNMR1.pt
+
+# DCode database (>47 MB)
+codes/v3_update_23_10_2025.csv
+
+# Build output
+Output/
+*.exe
+*.iss.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Temp / logs
+*.log
+*.tmp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test files
+test.csv
+scratch_*.py
+
+# Git
+*.orig
+
+# Private / interne Projektdateien (nicht fuer das oeffentliche Repo)
+Protokoll der Veränderungen.md
+ToDo.md
+ideen.md
