@@ -1,0 +1,10 @@
+# NMR Application Configuration File
+
+# Minimale Anzahl an '#' im Suchstring (Standard = 3)
+min_hashes = 3
+
+# Dark Mode aktivieren (true/false)
+dark_mode = false
+
+# Symmetrie-Mittelwertbildung aktivieren (true/false)
+symmetry_averaging = true
